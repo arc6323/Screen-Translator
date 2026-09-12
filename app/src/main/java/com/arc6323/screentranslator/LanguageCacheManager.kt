@@ -10,6 +10,7 @@ import java.util.Locale
 object LanguageCacheManager {
     private const val PREFS = "translator_prefs"
     private const val KEY_LANGUAGES = "cached_languages"
+    private const val KEY_DEFAULTS_MIGRATED = "defaults_migrated"
 
     data class Language(val code: String, val name: String)
 
@@ -35,7 +36,6 @@ object LanguageCacheManager {
         } else {
             @Suppress("DEPRECATION") context.resources.configuration.locale.language
         }?.lowercase(Locale.ROOT)
-
         val normalized = code ?: "en"
         return if (TranslateLanguage.fromLanguageTag(normalized) != null) normalized else "en"
     }
@@ -45,14 +45,30 @@ object LanguageCacheManager {
         return languages.firstOrNull { it.code == code }?.name ?: code
     }
 
-    fun selected(context: Context): Set<String> = context
-        .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        .getStringSet(KEY_LANGUAGES, setOf("ru", "en"))?.toSet() ?: setOf("ru", "en")
+    fun selected(context: Context): Set<String> {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val current = prefs.getStringSet(KEY_LANGUAGES, null)?.toMutableSet()
+        if (!prefs.getBoolean(KEY_DEFAULTS_MIGRATED, false)) {
+            val migrated = (current ?: emptySet()).toMutableSet().apply {
+                add("ru")
+                add("en")
+            }
+            prefs.edit()
+                .putStringSet(KEY_LANGUAGES, migrated)
+                .putBoolean(KEY_DEFAULTS_MIGRATED, true)
+                .apply()
+            return migrated
+        }
+        return current ?: setOf("ru", "en")
+    }
 
     fun saveSelected(context: Context, codes: Set<String>) {
         val valid = codes.filter { it in supportedCodes }.toSet().ifEmpty { setOf("ru", "en") }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putStringSet(KEY_LANGUAGES, valid).apply()
+            .edit()
+            .putStringSet(KEY_LANGUAGES, valid)
+            .putBoolean(KEY_DEFAULTS_MIGRATED, true)
+            .apply()
     }
 
     fun prepareSelected(
