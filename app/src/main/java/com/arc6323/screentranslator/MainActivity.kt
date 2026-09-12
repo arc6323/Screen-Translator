@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
@@ -20,6 +21,10 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        buildUi()
+    }
+
+    private fun buildUi() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -32,9 +37,11 @@ class MainActivity : Activity() {
         }
         val start = Button(this).apply { text = "ВКЛЮЧИТЬ LIVE-ПЕРЕВОД" }
         val stop = Button(this).apply { text = "ВЫКЛЮЧИТЬ" }
+        val settings = Button(this).apply { text = "НАСТРОЙКИ" }
         box.addView(title)
         box.addView(start)
         box.addView(stop)
+        box.addView(settings)
         setContentView(box)
 
         start.setOnClickListener { requestOverlayAndCapture() }
@@ -42,6 +49,7 @@ class MainActivity : Activity() {
             stopService(Intent(this, TranslatorService::class.java))
             Toast.makeText(this, "Live-перевод выключен", Toast.LENGTH_SHORT).show()
         }
+        settings.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
     }
 
     override fun onResume() {
