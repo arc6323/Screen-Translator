@@ -8,8 +8,8 @@ android {
         applicationId = "com.arc6323.screentranslator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
     }
 
     compileOptions {
