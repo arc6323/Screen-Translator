@@ -156,7 +156,7 @@ class TranslatorService : Service() {
 
     private fun processLines(bitmap: Bitmap, rawLines: List<Text.Line>, selected: Set<String>, thisGeneration: Long) {
         val lines = rawLines.filter { it.text.trim().length >= 2 && it.boundingBox != null }.take(30)
-        val target = LanguageCacheManager.targetLanguage()
+        val target = LanguageCacheManager.targetLanguage(this)
         if (lines.isEmpty()) {
             handler.post { if (thisGeneration == generation) overlayView?.setItems(emptyList()) }
             finishFrame(bitmap)
