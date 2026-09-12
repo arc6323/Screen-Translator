@@ -82,8 +82,7 @@ class TranslatorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (stopped) return START_NOT_STICKY
         try {
-            val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED)
-                ?: return START_NOT_STICKY
+            val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
             val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
             else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
             if (data == null) return START_NOT_STICKY
@@ -94,7 +93,6 @@ class TranslatorService : Service() {
             }
             projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
             projection?.registerCallback(projectionCallback, handler)
-
             val dm = resources.displayMetrics
             val width = dm.widthPixels
             val height = dm.heightPixels
@@ -106,7 +104,6 @@ class TranslatorService : Service() {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader!!.surface, null, handler
             ) ?: throw IllegalStateException("Virtual display unavailable")
-
             generation++
             handler.removeCallbacksAndMessages(null)
             handler.postDelayed(::scan, 1000)
@@ -130,8 +127,7 @@ class TranslatorService : Service() {
             if (bitmap == null) { busy = false; scheduleNext(); return }
 
             val selected = LanguageCacheManager.selected(this)
-            val recognizers = mutableListOf<TextRecognizer>()
-            recognizers.add(latin)
+            val recognizers = mutableListOf<TextRecognizer>(latin)
             if ("zh" in selected) recognizers.add(chinese)
             if ("hi" in selected) recognizers.add(devanagari)
             if ("ja" in selected) recognizers.add(japanese)
@@ -157,16 +153,16 @@ class TranslatorService : Service() {
     }
 
     private fun processLines(bitmap: Bitmap, rawLines: List<Text.Line>, selected: Set<String>, thisGeneration: Long) {
-        val lines = rawLines.filter { it.text.trim().length >= 2 }.take(30)
+        val lines = rawLines.filter { it.text.trim().length >= 2 && it.boundingBox != null }.take(30)
         val target = LanguageCacheManager.targetLanguage()
         if (lines.isEmpty()) {
             handler.post { if (thisGeneration == generation) overlayView?.setItems(emptyList()) }
             finishFrame(bitmap)
             return
         }
-
         val items = java.util.Collections.synchronizedList(mutableListOf<OverlayView.Item>())
         val pending = AtomicInteger(lines.size)
+        overlayView?.setItems(emptyList())
         lines.forEach { line ->
             languageId.identifyLanguage(line.text)
                 .addOnSuccessListener { source ->
@@ -204,9 +200,7 @@ class TranslatorService : Service() {
         try {
             val pair = "$source->$target"
             val translator = translators.getOrPut(pair) {
-                Translation.getClient(
-                    TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage(target).build()
-                )
+                Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage(target).build())
             }
             fun translateNow() {
                 translator.translate(text)
@@ -219,12 +213,11 @@ class TranslatorService : Service() {
                     .addOnFailureListener { done(null) }
             }
             if (pair in readyPairs) translateNow()
-            else translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
+            else translator.downloadModelIfNeeded(DownloadConditions.Builder().requireWifi().build())
                 .addOnSuccessListener { readyPairs.add(pair); translateNow() }
                 .addOnFailureListener { done(null) }
         } catch (e: Throwable) {
-            e.printStackTrace()
-            done(null)
+            e.printStackTrace(); done(null)
         }
     }
 
@@ -236,19 +229,26 @@ class TranslatorService : Service() {
 
     private fun scheduleNext() { if (!stopped) handler.postDelayed(::scan, 1600) }
 
-    private fun imageToBitmap(image: Image): Bitmap? = try {
-        val plane = image.planes[0]
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        if (pixelStride <= 0 || rowStride < pixelStride * image.width) return null
-        val rowPadding = rowStride - pixelStride * image.width
-        val paddedWidth = image.width + rowPadding / pixelStride
-        buffer.rewind()
-        val padded = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
-        padded.copyPixelsFromBuffer(buffer)
-        if (paddedWidth == image.width) padded else Bitmap.createBitmap(padded, 0, 0, image.width, image.height).also { padded.recycle() }
-    } catch (e: Throwable) { e.printStackTrace(); null }
+    private fun imageToBitmap(image: Image): Bitmap? {
+        return try {
+            val plane = image.planes[0]
+            val buffer = plane.buffer
+            val pixelStride = plane.pixelStride
+            val rowStride = plane.rowStride
+            if (pixelStride <= 0 || rowStride < pixelStride * image.width) {
+                null
+            } else {
+                val rowPadding = rowStride - pixelStride * image.width
+                val paddedWidth = image.width + rowPadding / pixelStride
+                buffer.rewind()
+                val padded = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
+                padded.copyPixelsFromBuffer(buffer)
+                if (paddedWidth == image.width) padded else Bitmap.createBitmap(padded, 0, 0, image.width, image.height).also { padded.recycle() }
+            }
+        } catch (e: Throwable) {
+            e.printStackTrace(); null
+        }
+    }
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
