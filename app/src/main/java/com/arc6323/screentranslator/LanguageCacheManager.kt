@@ -30,14 +30,18 @@ object LanguageCacheManager {
 
     private val supportedCodes = languages.map { it.code }.toSet()
 
+    /** Returns the phone's system language, not a possible per-app language override. */
     fun targetLanguage(context: Context): String {
-        val code = if (android.os.Build.VERSION.SDK_INT >= 24) {
-            context.resources.configuration.locales[0]?.language
+        val locale = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val manager = context.getSystemService(android.app.LocaleManager::class.java)
+            manager?.systemLocales?.get(0)
+        } else if (android.os.Build.VERSION.SDK_INT >= 24) {
+            android.os.LocaleList.getDefault().get(0)
         } else {
-            @Suppress("DEPRECATION") context.resources.configuration.locale.language
-        }?.lowercase(Locale.ROOT)
-        val normalized = code ?: "en"
-        return if (TranslateLanguage.fromLanguageTag(normalized) != null) normalized else "en"
+            @Suppress("DEPRECATION") Locale.getDefault()
+        }
+        val code = locale?.language?.lowercase(Locale.ROOT) ?: "en"
+        return if (TranslateLanguage.fromLanguageTag(code) != null) code else "en"
     }
 
     fun targetLanguageName(context: Context): String {
