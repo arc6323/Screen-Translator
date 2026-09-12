@@ -17,32 +17,19 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.TranslateRemoteModel
+import java.util.Locale
 
 class SettingsActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val boxes = linkedMapOf<String, CheckBox>()
+    private var batteryStatus: TextView? = null
 
     private val languages = linkedMapOf(
-        "en" to "Английский",
-        "de" to "Немецкий",
-        "fr" to "Французский",
-        "es" to "Испанский",
-        "it" to "Итальянский",
-        "pt" to "Португальский",
-        "pl" to "Польский",
-        "cs" to "Чешский",
-        "nl" to "Нидерландский",
-        "sv" to "Шведский",
-        "da" to "Датский",
-        "no" to "Норвежский",
-        "fi" to "Финский",
-        "tr" to "Турецкий",
-        "uk" to "Украинский",
-        "ja" to "Японский",
-        "ko" to "Корейский",
-        "zh" to "Китайский",
-        "ar" to "Арабский",
-        "hi" to "Хинди"
+        "en" to "Английский", "de" to "Немецкий", "fr" to "Французский", "es" to "Испанский",
+        "it" to "Итальянский", "pt" to "Португальский", "pl" to "Польский", "cs" to "Чешский",
+        "nl" to "Нидерландский", "sv" to "Шведский", "da" to "Датский", "no" to "Норвежский",
+        "fi" to "Финский", "tr" to "Турецкий", "uk" to "Украинский", "ja" to "Японский",
+        "ko" to "Корейский", "zh" to "Китайский", "ar" to "Арабский", "hi" to "Хинди"
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,16 +42,13 @@ class SettingsActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(32, 32, 32, 32)
         }
-        val title = TextView(this).apply {
+        content.addView(TextView(this).apply {
             text = "Настройки Screen Translator"
             textSize = 24f
             gravity = Gravity.CENTER
-        }
-        content.addView(title)
-
-        val target = LocaleInfo.deviceLanguageName(this)
+        })
         content.addView(TextView(this).apply {
-            text = "Язык перевода: $target (язык телефона)\n\nВыберите языки, модели которых нужно держать на телефоне. Приложение не будет автоматически скачивать остальные языки во время Live-перевода."
+            text = "Язык перевода: ${LocaleInfo.deviceLanguageName()} (язык телефона)\n\nВыберите языки, модели которых нужно держать на телефоне. Live-перевод не будет сам скачивать остальные модели."
             textSize = 16f
             setPadding(0, 24, 0, 20)
         })
@@ -80,38 +64,34 @@ class SettingsActivity : Activity() {
             content.addView(box)
         }
 
-        val download = Button(this).apply { text = "СКАЧАТЬ ВЫБРАННЫЕ МОДЕЛИ (Wi‑Fi)" }
-        content.addView(download)
-        download.setOnClickListener { downloadSelected() }
-
-        val delete = Button(this).apply { text = "УДАЛИТЬ НЕВЫБРАННЫЕ МОДЕЛИ" }
-        content.addView(delete)
-        delete.setOnClickListener { deleteUnselected() }
-
-        content.addView(TextView(this).apply {
-            text = "\nБатарея"
-            textSize = 20f
+        content.addView(Button(this).apply {
+            text = "СКАЧАТЬ ВЫБРАННЫЕ МОДЕЛИ (Wi‑Fi)"
+            setOnClickListener { downloadSelected() }
         })
-        val batteryStatus = TextView(this).apply { textSize = 15f }
+        content.addView(Button(this).apply {
+            text = "УДАЛИТЬ НЕВЫБРАННЫЕ МОДЕЛИ"
+            setOnClickListener { deleteUnselected() }
+        })
+
+        content.addView(TextView(this).apply { text = "\nБатарея"; textSize = 20f })
+        batteryStatus = TextView(this).apply { textSize = 15f }
         content.addView(batteryStatus)
-        updateBatteryStatus(batteryStatus)
+        updateBatteryStatus()
 
-        val battery = Button(this).apply { text = "РАЗРЕШИТЬ РАБОТУ БЕЗ ОГРАНИЧЕНИЙ" }
-        content.addView(battery)
-        battery.setOnClickListener { requestBatteryExemption() }
-
-        val inactive = Button(this).apply { text = "НАСТРОЙКИ НЕАКТИВНОГО ПРИЛОЖЕНИЯ" }
-        content.addView(inactive)
-        inactive.setOnClickListener { openAppDetails() }
-
+        content.addView(Button(this).apply {
+            text = "РАЗРЕШИТЬ РАБОТУ БЕЗ ОГРАНИЧЕНИЙ"
+            setOnClickListener { requestBatteryExemption() }
+        })
+        content.addView(Button(this).apply {
+            text = "НАСТРОЙКИ НЕАКТИВНОГО ПРИЛОЖЕНИЯ"
+            setOnClickListener { openAppDetails() }
+        })
         content.addView(TextView(this).apply {
-            text = "\nВажно: Android позволяет приложению попросить исключение из оптимизации батареи, но окончательное решение принимает пользователь/система. Настройку «не закрывать в неактивный период» приложение не может принудительно включить — на некоторых телефонах она относится к системным или фирменным ограничениям."
+            text = "\nAndroid позволяет запросить исключение из оптимизации батареи, но окончательное решение принимает пользователь/система. Настройку «не закрывать в неактивный период» приложение не может принудительно включить: на разных телефонах это системное или фирменное ограничение."
             textSize = 14f
         })
 
-        val scroll = ScrollView(this)
-        scroll.addView(content)
-        setContentView(scroll)
+        setContentView(ScrollView(this).apply { addView(content) })
     }
 
     private fun saveSelection(code: String, checked: Boolean) {
@@ -120,11 +100,10 @@ class SettingsActivity : Activity() {
         prefs.edit().putStringSet("cached_sources", set).apply()
     }
 
-    private fun selectedCodes(): Set<String> = boxes.filterValues { it.isChecked }.keys
+    fun selectedCodes(): Set<String> = boxes.filterValues { it.isChecked }.keys
 
     private fun downloadSelected() {
-        val target = Locale.getDefault().language
-        val selected = selectedCodes().toMutableSet().apply { add(target) }
+        val selected = selectedCodes().toMutableSet().apply { add(Locale.getDefault().language) }
         val manager = RemoteModelManager.getInstance()
         val conditions = DownloadConditions.Builder().requireWifi().build()
         Toast.makeText(this, "Скачивание выбранных моделей началось", Toast.LENGTH_SHORT).show()
@@ -132,10 +111,7 @@ class SettingsActivity : Activity() {
             val language = TranslateLanguage.fromLanguageTag(code) ?: return@forEach
             val model = TranslateRemoteModel.Builder(language).build()
             manager.download(model, conditions)
-                .addOnSuccessListener { }
-                .addOnFailureListener { e ->
-                    Toast.makeText(this, "Не удалось скачать $code: ${e.message}", Toast.LENGTH_LONG).show()
-                }
+                .addOnFailureListener { e -> Toast.makeText(this, "Не удалось скачать $code: ${e.message}", Toast.LENGTH_LONG).show() }
         }
     }
 
@@ -144,12 +120,7 @@ class SettingsActivity : Activity() {
         val manager = RemoteModelManager.getInstance()
         manager.getDownloadedModels(TranslateRemoteModel::class.java)
             .addOnSuccessListener { models ->
-                models.forEach { model ->
-                    val code = model.language
-                    if (!keep.contains(code)) {
-                        manager.deleteDownloadedModel(model)
-                    }
-                }
+                models.forEach { model -> if (!keep.contains(model.language)) manager.deleteDownloadedModel(model) }
                 Toast.makeText(this, "Невыбранные модели удаляются", Toast.LENGTH_SHORT).show()
             }
             .addOnFailureListener { e -> Toast.makeText(this, "Не удалось получить список моделей: ${e.message}", Toast.LENGTH_LONG).show() }
@@ -175,41 +146,24 @@ class SettingsActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        val root = findViewById<ScrollView>(android.R.id.content)?.getChildAt(0) as? LinearLayout
-        val status = root?.let { layout ->
-            (0 until layout.childCount).mapNotNull { layout.getChildAt(it) as? TextView }.firstOrNull { it.text.toString().startsWith("Оптимизация батареи") }
-        }
-        if (status != null) updateBatteryStatus(status)
+        updateBatteryStatus()
     }
 
-    private fun updateBatteryStatus(view: TextView) {
+    private fun updateBatteryStatus() {
+        val view = batteryStatus ?: return
         if (android.os.Build.VERSION.SDK_INT < 23) {
             view.text = "Оптимизация батареи: не требуется"
             return
         }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        view.text = if (pm.isIgnoringBatteryOptimizations(packageName)) {
-            "Оптимизация батареи: БЕЗ ОГРАНИЧЕНИЙ"
-        } else {
-            "Оптимизация батареи: включена"
-        }
+        view.text = if (pm.isIgnoringBatteryOptimizations(packageName)) "Оптимизация батареи: БЕЗ ОГРАНИЧЕНИЙ" else "Оптимизация батареи: включена"
     }
 }
 
 private object LocaleInfo {
-    fun deviceLanguageName(activity: Activity): String {
-        val code = java.util.Locale.getDefault().language
-        return when (code) {
-            "ru" -> "Русский"
-            "en" -> "English"
-            "de" -> "Deutsch"
-            "fr" -> "Français"
-            "es" -> "Español"
-            "it" -> "Italiano"
-            "zh" -> "中文"
-            "ja" -> "日本ский"
-            "ko" -> "한국어"
-            else -> code
-        }
+    fun deviceLanguageName(): String = when (Locale.getDefault().language) {
+        "ru" -> "Русский"; "en" -> "English"; "de" -> "Deutsch"; "fr" -> "Français";
+        "es" -> "Español"; "it" -> "Italiano"; "zh" -> "中文"; "ja" -> "日本ский"; "ko" -> "한국어";
+        else -> Locale.getDefault().language
     }
 }
