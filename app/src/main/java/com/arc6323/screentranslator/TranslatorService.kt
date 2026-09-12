@@ -26,6 +26,8 @@ import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.max
+import kotlin.math.min
 
 class TranslatorService : Service() {
     private var projection: MediaProjection? = null
@@ -164,12 +166,13 @@ class TranslatorService : Service() {
         val pending = AtomicInteger(lines.size)
         overlayView?.setItems(emptyList())
         lines.forEach { line ->
+            val rect = line.boundingBox ?: return@forEach
+            val background = sampleBackground(bitmap, rect)
             languageId.identifyLanguage(line.text)
                 .addOnSuccessListener { source ->
-                    val rect = line.boundingBox ?: Rect()
                     if (rect.width() > 0 && rect.height() > 0 && source in selected && source != target) {
-                        translateLine(line.text, source, target, thisGeneration) { translated ->
-                            if (translated != null) items.add(OverlayView.Item(Rect(rect), translated))
+                        translateLine(line.text, source, target, thisGeneration, background) { translated ->
+                            if (translated != null) items.add(OverlayView.Item(Rect(rect), translated, background))
                             completeLine(pending, items, thisGeneration)
                         }
                     } else {
@@ -179,6 +182,21 @@ class TranslatorService : Service() {
                 .addOnFailureListener { completeLine(pending, items, thisGeneration) }
         }
         if (!bitmap.isRecycled) bitmap.recycle()
+    }
+
+    private fun sampleBackground(bitmap: Bitmap, rect: Rect): Int {
+        val left = max(0, rect.left - 3)
+        val right = min(bitmap.width - 1, rect.right + 3)
+        val top = max(0, rect.top - 3)
+        val bottom = min(bitmap.height - 1, rect.bottom + 3)
+        var r = 0L; var g = 0L; var b = 0L; var count = 0L
+        fun add(x: Int, y: Int) {
+            val c = bitmap.getPixel(x, y)
+            r += Color.red(c); g += Color.green(c); b += Color.blue(c); count++
+        }
+        for (x in left..right) { add(x, top); add(x, bottom) }
+        for (y in top..bottom) { add(left, y); add(right, y) }
+        return if (count == 0L) Color.rgb(25, 25, 25) else Color.rgb((r / count).toInt(), (g / count).toInt(), (b / count).toInt())
     }
 
     private fun completeLine(pending: AtomicInteger, items: MutableList<OverlayView.Item>, thisGeneration: Long) {
@@ -193,7 +211,7 @@ class TranslatorService : Service() {
         }
     }
 
-    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, done: (String?) -> Unit) {
+    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, background: Int, done: (String?) -> Unit) {
         if (thisGeneration != generation) { done(null); return }
         val key = "$source|$target|$text"
         translationCache[key]?.let { done(it); return }
@@ -216,9 +234,7 @@ class TranslatorService : Service() {
             else translator.downloadModelIfNeeded(DownloadConditions.Builder().requireWifi().build())
                 .addOnSuccessListener { readyPairs.add(pair); translateNow() }
                 .addOnFailureListener { done(null) }
-        } catch (e: Throwable) {
-            e.printStackTrace(); done(null)
-        }
+        } catch (e: Throwable) { e.printStackTrace(); done(null) }
     }
 
     private fun finishFrame(bitmap: Bitmap) {
@@ -235,9 +251,7 @@ class TranslatorService : Service() {
             val buffer = plane.buffer
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
-            if (pixelStride <= 0 || rowStride < pixelStride * image.width) {
-                null
-            } else {
+            if (pixelStride <= 0 || rowStride < pixelStride * image.width) null else {
                 val rowPadding = rowStride - pixelStride * image.width
                 val paddedWidth = image.width + rowPadding / pixelStride
                 buffer.rewind()
@@ -245,9 +259,7 @@ class TranslatorService : Service() {
                 padded.copyPixelsFromBuffer(buffer)
                 if (paddedWidth == image.width) padded else Bitmap.createBitmap(padded, 0, 0, image.width, image.height).also { padded.recycle() }
             }
-        } catch (e: Throwable) {
-            e.printStackTrace(); null
-        }
+        } catch (e: Throwable) { e.printStackTrace(); null }
     }
 
     private fun createChannel() {
