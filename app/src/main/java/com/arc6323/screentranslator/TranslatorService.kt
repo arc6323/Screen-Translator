@@ -9,38 +9,47 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.view.*
-import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.languageid.LanguageIdentifier
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
-import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.max
-import kotlin.math.min
+import java.util.LinkedHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class TranslatorService : Service() {
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var display: android.hardware.display.VirtualDisplay? = null
-    private var windowManager: WindowManager? = null
-    private var overlayView: TranslationOverlayView? = null
+    private var overlayWindow: WindowManager? = null
+    private var overlayView: OverlayView? = null
     private val handler = Handler(Looper.getMainLooper())
     private var busy = false
     private var stopped = false
-    private var frameId = 0L
-    private val downloadedLanguages = mutableSetOf<String>()
-    private val translators = ConcurrentHashMap<String, Translator>()
-    private var recognizer: TextRecognizer? = null
-    private var languageIdentifier: LanguageIdentifier? = null
+    private var generation = 0L
+
+    private lateinit var latin: TextRecognizer
+    private lateinit var chinese: TextRecognizer
+    private lateinit var devanagari: TextRecognizer
+    private lateinit var japanese: TextRecognizer
+    private lateinit var korean: TextRecognizer
+    private lateinit var languageId: LanguageIdentifier
+
+    private val translators = mutableMapOf<String, Translator>()
+    private val readyPairs = mutableSetOf<String>()
+    private val translationCache = object : LinkedHashMap<String, String>(200, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 200
+    }
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() { stopSelf() }
@@ -50,23 +59,42 @@ class TranslatorService : Service() {
         super.onCreate()
         createChannel()
         startForeground(7, notification())
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        languageIdentifier = LanguageIdentification.getClient()
-        overlayView = TranslationOverlayView(this)
-        refreshDownloadedLanguages()
+        overlayWindow = getSystemService(WINDOW_SERVICE) as WindowManager
+        latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        chinese = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+        devanagari = TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
+        japanese = TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+        korean = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+        languageId = LanguageIdentification.getClient()
+        overlayView = OverlayView(this)
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        try { overlayWindow?.addView(overlayView, lp) } catch (e: Throwable) { e.printStackTrace() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (stopped) return START_NOT_STICKY
         try {
-            val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
+            val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+                ?: return START_NOT_STICKY
             val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
             else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
             if (data == null) return START_NOT_STICKY
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection?.let { old ->
+                try { old.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
+                try { old.stop() } catch (_: Throwable) {}
+            }
             projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
             projection?.registerCallback(projectionCallback, handler)
+
             val dm = resources.displayMetrics
             val width = dm.widthPixels
             val height = dm.heightPixels
@@ -78,9 +106,10 @@ class TranslatorService : Service() {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader!!.surface, null, handler
             ) ?: throw IllegalStateException("Virtual display unavailable")
-            attachOverlay()
+
+            generation++
             handler.removeCallbacksAndMessages(null)
-            handler.postDelayed(::scan, 900)
+            handler.postDelayed(::scan, 1000)
         } catch (e: Throwable) {
             e.printStackTrace()
             stopSelf()
@@ -88,126 +117,124 @@ class TranslatorService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun attachOverlay() {
-        try {
-            val view = overlayView ?: return
-            if (view.windowToken != null) return
-            val dm = resources.displayMetrics
-            val lp = WindowManager.LayoutParams(
-                dm.widthPixels, dm.heightPixels,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-            )
-            lp.gravity = Gravity.TOP or Gravity.START
-            windowManager?.addView(view, lp)
-        } catch (e: Throwable) { e.printStackTrace() }
-    }
-
-    private fun refreshDownloadedLanguages() {
-        RemoteModelManager.getInstance().getDownloadedModels(TranslateRemoteModel::class.java)
-            .addOnSuccessListener { models ->
-                downloadedLanguages.clear()
-                downloadedLanguages.addAll(models.map { it.language })
-            }
-            .addOnFailureListener { it.printStackTrace() }
-    }
-
     private fun scan() {
-        if (stopped) return
+        if (stopped || busy) { scheduleNext(); return }
         var image: Image? = null
-        var bitmap: Bitmap? = null
-        val currentFrame = ++frameId
+        val thisGeneration = ++generation
         try {
             image = reader?.acquireLatestImage()
-            if (image == null || busy) {
-                image?.close()
-                scheduleNext()
-                return
-            }
+            if (image == null) { scheduleNext(); return }
             busy = true
-            bitmap = imageToBitmap(image)
+            val bitmap = imageToBitmap(image)
             image.close(); image = null
             if (bitmap == null) { busy = false; scheduleNext(); return }
 
-            overlayView?.setItems(emptyList())
-            val frameBitmap = bitmap
-            recognizer?.process(InputImage.fromBitmap(frameBitmap, 0))
-                ?.addOnSuccessListener { result ->
-                    if (stopped || currentFrame != frameId) return@addOnSuccessListener
-                    val lines = result.textBlocks.flatMap { it.lines }
-                        .filter { it.text.trim().length >= 2 && it.boundingBox != null }
-                        .take(18)
-                    lines.forEach { line ->
-                        val rect = line.boundingBox ?: return@forEach
-                        val background = sampleBackground(frameBitmap, rect)
-                        identifyAndTranslate(line, currentFrame, background)
+            val selected = LanguageCacheManager.selected(this)
+            val recognizers = mutableListOf<TextRecognizer>()
+            recognizers.add(latin)
+            if ("zh" in selected) recognizers.add(chinese)
+            if ("hi" in selected) recognizers.add(devanagari)
+            if ("ja" in selected) recognizers.add(japanese)
+            if ("ko" in selected) recognizers.add(korean)
+
+            val allLines = java.util.Collections.synchronizedList(mutableListOf<Text.Line>())
+            val pendingRecognizers = AtomicInteger(recognizers.size)
+            recognizers.forEach { recognizer ->
+                recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                    .addOnSuccessListener { result -> allLines.addAll(result.textBlocks.flatMap { it.lines }) }
+                    .addOnCompleteListener {
+                        if (pendingRecognizers.decrementAndGet() == 0) {
+                            processLines(bitmap, allLines.distinctBy { "${it.text}|${it.boundingBox}" }, selected, thisGeneration)
+                        }
                     }
-                }
-                ?.addOnCompleteListener {
-                    if (!frameBitmap.isRecycled) frameBitmap.recycle()
-                    busy = false
-                    scheduleNext()
-                }
-                ?: run {
-                    frameBitmap.recycle(); busy = false; scheduleNext()
-                }
+            }
         } catch (e: Throwable) {
             e.printStackTrace()
             try { image?.close() } catch (_: Throwable) {}
-            try { bitmap?.recycle() } catch (_: Throwable) {}
             busy = false
             scheduleNext()
         }
     }
 
-    private fun identifyAndTranslate(line: Text.Line, frame: Long, background: Int) {
-        val sourceText = line.text.trim()
-        val target = Locale.getDefault().language.lowercase(Locale.ROOT)
-        languageIdentifier?.identifyLanguage(sourceText)
-            ?.addOnSuccessListener { source ->
-                if (stopped || frame != frameId || source == "und" || source == target) return@addOnSuccessListener
-                val selected = getSharedPreferences("settings", MODE_PRIVATE)
-                    .getStringSet("cached_sources", setOf("en")) ?: emptySet()
-                if (!selected.contains(source)) return@addOnSuccessListener
-                if (!downloadedLanguages.contains(source) || !downloadedLanguages.contains(target)) return@addOnSuccessListener
-                val rect = line.boundingBox ?: return@addOnSuccessListener
-                translate(line, source, target, frame, rect, background)
-            }
-    }
+    private fun processLines(bitmap: Bitmap, rawLines: List<Text.Line>, selected: Set<String>, thisGeneration: Long) {
+        val lines = rawLines.filter { it.text.trim().length >= 2 }.take(30)
+        val target = LanguageCacheManager.targetLanguage()
+        if (lines.isEmpty()) {
+            handler.post { if (thisGeneration == generation) overlayView?.setItems(emptyList()) }
+            finishFrame(bitmap)
+            return
+        }
 
-    private fun translate(line: Text.Line, source: String, target: String, frame: Long, rect: Rect, background: Int) {
-        val sourceLang = TranslateLanguage.fromLanguageTag(source) ?: return
-        val targetLang = TranslateLanguage.fromLanguageTag(target) ?: return
-        try {
-            val key = "$source->$target"
-            val translator = translators.getOrPut(key) {
-                Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(sourceLang).setTargetLanguage(targetLang).build())
-            }
-            translator.translate(line.text)
-                .addOnSuccessListener { translated ->
-                    if (stopped || frame != frameId || translated.isBlank()) return@addOnSuccessListener
-                    overlayView?.putItem(TranslationItem(rect, translated, background))
+        val items = java.util.Collections.synchronizedList(mutableListOf<OverlayView.Item>())
+        val pending = AtomicInteger(lines.size)
+        lines.forEach { line ->
+            languageId.identifyLanguage(line.text)
+                .addOnSuccessListener { source ->
+                    val rect = line.boundingBox ?: Rect()
+                    if (rect.width() > 0 && rect.height() > 0 && source in selected && source != target) {
+                        translateLine(line.text, source, target, thisGeneration) { translated ->
+                            if (translated != null) items.add(OverlayView.Item(Rect(rect), translated))
+                            completeLine(pending, items, thisGeneration)
+                        }
+                    } else {
+                        completeLine(pending, items, thisGeneration)
+                    }
                 }
-                .addOnFailureListener { }
-        } catch (e: Throwable) { e.printStackTrace() }
+                .addOnFailureListener { completeLine(pending, items, thisGeneration) }
+        }
+        if (!bitmap.isRecycled) bitmap.recycle()
     }
 
-    private fun sampleBackground(bitmap: Bitmap, rect: Rect): Int {
-        val left = max(0, rect.left - 3)
-        val right = min(bitmap.width - 1, rect.right + 3)
-        val top = max(0, rect.top - 3)
-        val bottom = min(bitmap.height - 1, rect.bottom + 3)
-        var r = 0L; var g = 0L; var b = 0L; var count = 0L
-        fun add(x: Int, y: Int) { val c = bitmap.getPixel(x, y); r += Color.red(c); g += Color.green(c); b += Color.blue(c); count++ }
-        for (x in left..right) { add(x, top); add(x, bottom) }
-        for (y in top..bottom) { add(left, y); add(right, y) }
-        return if (count == 0L) Color.rgb(25, 25, 25) else Color.rgb((r / count).toInt(), (g / count).toInt(), (b / count).toInt())
+    private fun completeLine(pending: AtomicInteger, items: MutableList<OverlayView.Item>, thisGeneration: Long) {
+        if (pending.decrementAndGet() == 0) {
+            handler.post {
+                if (!stopped && thisGeneration == generation) {
+                    overlayView?.setItems(items.sortedWith(compareBy({ it.rect.top }, { it.rect.left })))
+                }
+            }
+            busy = false
+            scheduleNext()
+        }
     }
 
-    private fun scheduleNext() { if (!stopped) handler.postDelayed(::scan, 1200) }
+    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, done: (String?) -> Unit) {
+        if (thisGeneration != generation) { done(null); return }
+        val key = "$source|$target|$text"
+        translationCache[key]?.let { done(it); return }
+        try {
+            val pair = "$source->$target"
+            val translator = translators.getOrPut(pair) {
+                Translation.getClient(
+                    TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage(target).build()
+                )
+            }
+            fun translateNow() {
+                translator.translate(text)
+                    .addOnSuccessListener { translated ->
+                        if (thisGeneration == generation && translated.isNotBlank()) {
+                            translationCache[key] = translated
+                            done(translated)
+                        } else done(null)
+                    }
+                    .addOnFailureListener { done(null) }
+            }
+            if (pair in readyPairs) translateNow()
+            else translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                .addOnSuccessListener { readyPairs.add(pair); translateNow() }
+                .addOnFailureListener { done(null) }
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            done(null)
+        }
+    }
+
+    private fun finishFrame(bitmap: Bitmap) {
+        if (!bitmap.isRecycled) bitmap.recycle()
+        busy = false
+        scheduleNext()
+    }
+
+    private fun scheduleNext() { if (!stopped) handler.postDelayed(::scan, 1600) }
 
     private fun imageToBitmap(image: Image): Bitmap? = try {
         val plane = image.planes[0]
@@ -242,61 +269,20 @@ class TranslatorService : Service() {
     override fun onDestroy() {
         stopped = true
         handler.removeCallbacksAndMessages(null)
-        try { windowManager?.removeView(overlayView) } catch (_: Throwable) {}
+        try { overlayWindow?.removeView(overlayView) } catch (_: Throwable) {}
         translators.values.forEach { try { it.close() } catch (_: Throwable) {} }
         translators.clear()
-        recognizer?.close()
-        languageIdentifier?.close()
+        try { latin.close() } catch (_: Throwable) {}
+        try { chinese.close() } catch (_: Throwable) {}
+        try { devanagari.close() } catch (_: Throwable) {}
+        try { japanese.close() } catch (_: Throwable) {}
+        try { korean.close() } catch (_: Throwable) {}
+        try { languageId.close() } catch (_: Throwable) {}
         try { display?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         try { projection?.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
         try { projection?.stop() } catch (_: Throwable) {}
         display = null; reader = null; projection = null; overlayView = null
         super.onDestroy()
-    }
-
-    data class TranslationItem(val rect: Rect, val text: String, val background: Int)
-
-    private class TranslationOverlayView(context: Context) : View(context) {
-        private val items = LinkedHashMap<String, TranslationItem>()
-        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-            isSubpixelText = true
-        }
-
-        fun setItems(newItems: List<TranslationItem>) {
-            items.clear(); newItems.forEach { items[key(it)] = it }; invalidate()
-        }
-
-        fun putItem(item: TranslationItem) {
-            items[key(item)] = item; invalidate()
-        }
-
-        private fun key(item: TranslationItem): String = "${item.rect.left}:${item.rect.top}:${item.rect.right}:${item.rect.bottom}"
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            items.values.toList().forEach { item ->
-                val r = item.rect
-                val left = max(0, r.left - 5).toFloat()
-                val top = max(0, r.top - 4).toFloat()
-                val right = min(width, r.right + 5).toFloat()
-                val bottom = min(height, r.bottom + 4).toFloat()
-                bgPaint.color = item.background
-                canvas.drawRect(left, top, right, bottom, bgPaint)
-                var size = (r.height() * 0.72f).coerceIn(10f, 42f)
-                textPaint.color = if (isLight(item.background)) Color.BLACK else Color.WHITE
-                textPaint.textSize = size
-                val maxWidth = max(40f, right - left - 10f)
-                while (textPaint.measureText(item.text) > maxWidth && size > 9f) { size -= 1f; textPaint.textSize = size }
-                val fm = textPaint.fontMetrics
-                val baseline = top + (bottom - top - fm.bottom - fm.top) / 2f
-                canvas.drawText(item.text, left + 5f, baseline, textPaint)
-            }
-        }
-
-        private fun isLight(color: Int): Boolean =
-            (0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)) > 160
     }
 }
