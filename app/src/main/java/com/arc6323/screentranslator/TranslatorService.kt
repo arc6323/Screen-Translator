@@ -146,10 +146,11 @@ class TranslatorService : Service() {
                     val translated = mutableListOf<TranslationItem>()
                     var pending = lines.size
                     lines.forEach { line ->
+                        val background = sampleBackground(bitmap, line.boundingBox)
                         lid.identifyLanguage(line.text).addOnSuccessListener { lang ->
                             val target = Locale.getDefault().language
                             if (lang != "und" && lang != target && cachedLanguages.contains(lang)) {
-                                translate(line, lang, target, currentFrame) { item ->
+                                translate(line, lang, target, currentFrame, background) { item ->
                                     if (item != null && currentFrame == frameId) translated.add(item)
                                     pending--
                                     if (pending <= 0 && currentFrame == frameId) {
@@ -186,6 +187,29 @@ class TranslatorService : Service() {
         }
     }
 
+    private fun sampleBackground(bitmap: Bitmap, rect: Rect?): Int {
+        if (rect == null) return Color.rgb(25, 25, 25)
+        val left = max(0, rect.left - 3)
+        val right = min(bitmap.width - 1, rect.right + 3)
+        val top = max(0, rect.top - 3)
+        val bottom = min(bitmap.height - 1, rect.bottom + 3)
+        var r = 0L; var g = 0L; var b = 0L; var count = 0L
+        fun addPixel(x: Int, y: Int) {
+            val c = bitmap.getPixel(x, y)
+            r += Color.red(c); g += Color.green(c); b += Color.blue(c); count++
+        }
+        for (x in left..right) {
+            addPixel(x, top)
+            addPixel(x, bottom)
+        }
+        for (y in top..bottom) {
+            addPixel(left, y)
+            addPixel(right, y)
+        }
+        if (count == 0L) return Color.rgb(25, 25, 25)
+        return Color.rgb((r / count).toInt(), (g / count).toInt(), (b / count).toInt())
+    }
+
     private fun scheduleNext() {
         if (!stopped) handler.postDelayed(::scan, 1600)
     }
@@ -212,7 +236,14 @@ class TranslatorService : Service() {
         }
     }
 
-    private fun translate(line: Text.Line, source: String, target: String, frame: Long, done: (TranslationItem?) -> Unit) {
+    private fun translate(
+        line: Text.Line,
+        source: String,
+        target: String,
+        frame: Long,
+        background: Int,
+        done: (TranslationItem?) -> Unit
+    ) {
         if (source == target || source == "und" || target == "und" || !cachedLanguages.contains(source)) {
             done(null); return
         }
@@ -224,7 +255,7 @@ class TranslatorService : Service() {
             }
             translator.translate(line.text)
                 .addOnSuccessListener { translated ->
-                    if (frame != frameId) done(null) else done(TranslationItem(line.boundingBox, translated))
+                    if (frame != frameId) done(null) else done(TranslationItem(line.boundingBox, translated, background))
                 }
                 .addOnFailureListener { done(null) }
         } catch (e: Throwable) {
@@ -262,7 +293,7 @@ class TranslatorService : Service() {
         super.onDestroy()
     }
 
-    data class TranslationItem(val rect: Rect?, val text: String)
+    data class TranslationItem(val rect: Rect?, val text: String, val background: Int)
 
     private class TranslationOverlayView(context: Context) : View(context) {
         private val items = mutableListOf<TranslationItem>()
@@ -286,11 +317,11 @@ class TranslatorService : Service() {
                 val top = max(0, r.top - 4).toFloat()
                 val right = min(width, r.right + 5).toFloat()
                 val bottom = min(height, r.bottom + 4).toFloat()
-                bgPaint.color = Color.argb(242, 25, 25, 25)
+                bgPaint.color = item.background
                 canvas.drawRect(left, top, right, bottom, bgPaint)
 
                 var size = (r.height() * 0.72f).coerceIn(10f, 42f)
-                textPaint.color = Color.WHITE
+                textPaint.color = if (isLight(item.background)) Color.BLACK else Color.WHITE
                 textPaint.textSize = size
                 val maxWidth = max(40f, right - left - 10f)
                 while (textPaint.measureText(item.text) > maxWidth && size > 9f) {
@@ -301,6 +332,11 @@ class TranslatorService : Service() {
                 val baseline = top + (bottom - top - fm.bottom - fm.top) / 2f
                 canvas.drawText(item.text, left + 5f, baseline, textPaint)
             }
+        }
+
+        private fun isLight(color: Int): Boolean {
+            val luminance = (0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color))
+            return luminance > 160
         }
     }
 }
