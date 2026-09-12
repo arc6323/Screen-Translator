@@ -1,6 +1,7 @@
 package com.arc6323.screentranslator
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -10,6 +11,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 
@@ -20,9 +22,18 @@ class MainActivity : Activity() {
     private var captureRequested = false
     private lateinit var cacheStatus: TextView
     private lateinit var batteryStatus: TextView
+    private var downloadDialog: AlertDialog? = null
+    private var downloadProgress: ProgressBar? = null
+    private var downloadText: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        buildUi()
+        refreshStatus()
+        prepareDefaultCache()
+    }
+
+    private fun buildUi() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -56,7 +67,6 @@ class MainActivity : Activity() {
         }
         languages.setOnClickListener { showLanguageDialog() }
         battery.setOnClickListener { requestBackgroundOperation() }
-        refreshStatus()
     }
 
     override fun onResume() {
@@ -70,42 +80,87 @@ class MainActivity : Activity() {
 
     private fun refreshStatus() {
         val selected = LanguageCacheManager.selected(this)
-        val names = LanguageCacheManager.languages.filter { it.code in selected }.joinToString(", ") { it.name }
-        cacheStatus.text = "Кэш: $names\nЯзык телефона: ${LanguageCacheManager.targetLanguage()}"
+        val names = LanguageCacheManager.languages
+            .filter { it.code in selected }
+            .joinToString(", ") { it.name }
+        cacheStatus.text = "Кэш: $names\nЯзык телефона: ${LanguageCacheManager.targetLanguageName(this)}"
+
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val batteryFree = android.os.Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(packageName)
         batteryStatus.text = if (batteryFree) "Батарея: без ограничений" else "Батарея: оптимизация включена"
+    }
+
+    private fun prepareDefaultCache() {
+        LanguageCacheManager.prepareSelected(this) { done, total, failed ->
+            runOnUiThread {
+                refreshStatus()
+                if (total > 0 && done < total) {
+                    cacheStatus.text = "Кэш: подготовка моделей $done/$total\nЯзык телефона: ${LanguageCacheManager.targetLanguageName(this)}"
+                } else if (failed > 0) {
+                    cacheStatus.text = "Кэш: ошибок загрузки $failed\nЯзык телефона: ${LanguageCacheManager.targetLanguageName(this)}"
+                }
+            }
+        }
     }
 
     private fun showLanguageDialog() {
         val all = LanguageCacheManager.languages
         val selected = LanguageCacheManager.selected(this).toMutableSet()
         val checked = all.map { it.code in selected }.toBooleanArray()
-        android.app.AlertDialog.Builder(this)
+
+        AlertDialog.Builder(this)
             .setTitle("Языки для кэширования")
             .setMultiChoiceItems(all.map { it.name }.toTypedArray(), checked) { _, which, isChecked ->
                 if (isChecked) selected.add(all[which].code) else selected.remove(all[which].code)
             }
             .setNegativeButton("ОТМЕНА", null)
             .setPositiveButton("СОХРАНИТЬ") { _, _ ->
-                if (selected.isEmpty()) selected.add("en")
+                if (selected.isEmpty()) selected.add("ru")
                 LanguageCacheManager.saveSelected(this, selected)
-                Toast.makeText(this, "Подготавливаю выбранные модели…", Toast.LENGTH_SHORT).show()
+                refreshStatus()
+                showDownloadProgress()
                 LanguageCacheManager.prepareSelected(this) { done, total, failed ->
-                    if (done == total) {
-                        runOnUiThread {
-                            Toast.makeText(
-                                this,
-                                if (failed == 0) "Языковые модели готовы" else "Готово, ошибок: $failed",
-                                Toast.LENGTH_LONG
-                            ).show()
-                            refreshStatus()
+                    runOnUiThread {
+                        downloadProgress?.max = total.coerceAtLeast(1)
+                        downloadProgress?.progress = done
+                        downloadText?.text = if (done >= total) {
+                            if (failed == 0) "Готово: все выбранные модели доступны" else "Готово с ошибками: $failed"
+                        } else {
+                            "Загрузка языковых моделей: $done/$total"
+                        }
+                        refreshStatus()
+                        if (done >= total) {
+                            downloadDialog?.window?.decorView?.postDelayed({
+                                downloadDialog?.dismiss()
+                            }, 900)
                         }
                     }
                 }
-                refreshStatus()
             }
             .show()
+    }
+
+    private fun showDownloadProgress() {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 8, 48, 16)
+        }
+        downloadText = TextView(this).apply {
+            text = "Подготовка языковых моделей: 0%"
+            textSize = 15f
+        }
+        downloadProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1
+            progress = 0
+        }
+        content.addView(downloadText)
+        content.addView(downloadProgress)
+        downloadDialog = AlertDialog.Builder(this)
+            .setTitle("Кэширование языков")
+            .setView(content)
+            .setNegativeButton("СКРЫТЬ", null)
+            .create()
+        downloadDialog?.show()
     }
 
     private fun requestBackgroundOperation() {
