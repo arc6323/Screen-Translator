@@ -64,11 +64,9 @@ class TranslatorService : Service() {
             val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
             else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
             if (data == null) return START_NOT_STICKY
-
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
             projection?.registerCallback(projectionCallback, handler)
-
             val dm = resources.displayMetrics
             val width = dm.widthPixels
             val height = dm.heightPixels
@@ -80,7 +78,6 @@ class TranslatorService : Service() {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader!!.surface, null, handler
             ) ?: throw IllegalStateException("Virtual display unavailable")
-
             attachOverlay()
             handler.removeCallbacksAndMessages(null)
             handler.postDelayed(::scan, 900)
@@ -143,7 +140,11 @@ class TranslatorService : Service() {
                     val lines = result.textBlocks.flatMap { it.lines }
                         .filter { it.text.trim().length >= 2 && it.boundingBox != null }
                         .take(18)
-                    lines.forEach { line -> identifyAndTranslate(line, frameBitmap, currentFrame) }
+                    lines.forEach { line ->
+                        val rect = line.boundingBox ?: return@forEach
+                        val background = sampleBackground(frameBitmap, rect)
+                        identifyAndTranslate(line, currentFrame, background)
+                    }
                 }
                 ?.addOnCompleteListener {
                     if (!frameBitmap.isRecycled) frameBitmap.recycle()
@@ -162,7 +163,7 @@ class TranslatorService : Service() {
         }
     }
 
-    private fun identifyAndTranslate(line: Text.Line, bitmap: Bitmap, frame: Long) {
+    private fun identifyAndTranslate(line: Text.Line, frame: Long, background: Int) {
         val sourceText = line.text.trim()
         val target = Locale.getDefault().language.lowercase(Locale.ROOT)
         languageIdentifier?.identifyLanguage(sourceText)
@@ -173,7 +174,6 @@ class TranslatorService : Service() {
                 if (!selected.contains(source)) return@addOnSuccessListener
                 if (!downloadedLanguages.contains(source) || !downloadedLanguages.contains(target)) return@addOnSuccessListener
                 val rect = line.boundingBox ?: return@addOnSuccessListener
-                val background = sampleBackground(bitmap, rect)
                 translate(line, source, target, frame, rect, background)
             }
     }
@@ -184,8 +184,7 @@ class TranslatorService : Service() {
         try {
             val key = "$source->$target"
             val translator = translators.getOrPut(key) {
-                Translation.getClient(TranslatorOptions.Builder()
-                    .setSourceLanguage(sourceLang).setTargetLanguage(targetLang).build())
+                Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(sourceLang).setTargetLanguage(targetLang).build())
             }
             translator.translate(line.text)
                 .addOnSuccessListener { translated ->
@@ -267,14 +266,11 @@ class TranslatorService : Service() {
         }
 
         fun setItems(newItems: List<TranslationItem>) {
-            items.clear()
-            newItems.forEach { items[key(it)] = it }
-            invalidate()
+            items.clear(); newItems.forEach { items[key(it)] = it }; invalidate()
         }
 
         fun putItem(item: TranslationItem) {
-            items[key(item)] = item
-            invalidate()
+            items[key(item)] = item; invalidate()
         }
 
         private fun key(item: TranslationItem): String = "${item.rect.left}:${item.rect.top}:${item.rect.right}:${item.rect.bottom}"
@@ -289,15 +285,11 @@ class TranslatorService : Service() {
                 val bottom = min(height, r.bottom + 4).toFloat()
                 bgPaint.color = item.background
                 canvas.drawRect(left, top, right, bottom, bgPaint)
-
                 var size = (r.height() * 0.72f).coerceIn(10f, 42f)
                 textPaint.color = if (isLight(item.background)) Color.BLACK else Color.WHITE
                 textPaint.textSize = size
                 val maxWidth = max(40f, right - left - 10f)
-                while (textPaint.measureText(item.text) > maxWidth && size > 9f) {
-                    size -= 1f
-                    textPaint.textSize = size
-                }
+                while (textPaint.measureText(item.text) > maxWidth && size > 9f) { size -= 1f; textPaint.textSize = size }
                 val fm = textPaint.fontMetrics
                 val baseline = top + (bottom - top - fm.bottom - fm.top) / 2f
                 canvas.drawText(item.text, left + 5f, baseline, textPaint)
