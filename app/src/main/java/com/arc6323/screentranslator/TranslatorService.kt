@@ -9,26 +9,31 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.view.*
-import android.widget.TextView
-import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
+import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.util.Locale
+import kotlin.math.max
+import kotlin.math.min
 
 class TranslatorService : Service() {
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
     private var display: android.hardware.display.VirtualDisplay? = null
-    private var overlay: WindowManager? = null
-    private val labels = mutableListOf<TextView>()
+    private var windowManager: WindowManager? = null
+    private var overlayView: TranslationOverlayView? = null
     private val handler = Handler(Looper.getMainLooper())
     private var busy = false
     private var stopped = false
+    private var frameId = 0L
+    private val cachedLanguages = mutableSetOf<String>()
+    private val translators = mutableMapOf<String, com.google.mlkit.nl.translate.Translator>()
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() { stopSelf() }
@@ -38,7 +43,9 @@ class TranslatorService : Service() {
         super.onCreate()
         createChannel()
         startForeground(7, notification())
-        overlay = getSystemService(WINDOW_SERVICE) as WindowManager
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        overlayView = TranslationOverlayView(this)
+        refreshCachedLanguages()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -68,13 +75,44 @@ class TranslatorService : Service() {
                 reader!!.surface, null, handler
             ) ?: throw IllegalStateException("Virtual display unavailable")
 
+            attachOverlay()
             handler.removeCallbacksAndMessages(null)
-            handler.postDelayed(::scan, 1200)
+            handler.postDelayed(::scan, 1000)
         } catch (e: Throwable) {
             e.printStackTrace()
             stopSelf()
         }
         return START_NOT_STICKY
+    }
+
+    private fun attachOverlay() {
+        if (overlayView == null || windowManager == null) return
+        try {
+            if (overlayView?.windowToken != null) return
+            val dm = resources.displayMetrics
+            val lp = WindowManager.LayoutParams(
+                dm.widthPixels,
+                dm.heightPixels,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            windowManager?.addView(overlayView, lp)
+        } catch (e: Throwable) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun refreshCachedLanguages() {
+        RemoteModelManager.getInstance().getDownloadedModels(TranslateRemoteModel::class.java)
+            .addOnSuccessListener { models ->
+                cachedLanguages.clear()
+                models.forEach { cachedLanguages.add(it.language) }
+            }
+            .addOnFailureListener { it.printStackTrace() }
     }
 
     private fun scan() {
@@ -94,24 +132,50 @@ class TranslatorService : Service() {
                 busy = false; scheduleNext(); return
             }
 
+            val currentFrame = ++frameId
             val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
             recognizer.process(InputImage.fromBitmap(bitmap, 0))
                 .addOnSuccessListener { result ->
-                    clearOverlay()
-                    val lines = result.textBlocks.flatMap { it.lines }.take(30)
-                    if (lines.isEmpty()) return@addOnSuccessListener
+                    if (stopped || currentFrame != frameId) return@addOnSuccessListener
+                    val lines = result.textBlocks.flatMap { it.lines }.take(20)
+                    if (lines.isEmpty()) {
+                        handler.post { overlayView?.setItems(emptyList()) }
+                        return@addOnSuccessListener
+                    }
                     val lid = LanguageIdentification.getClient()
+                    val translated = mutableListOf<TranslationItem>()
+                    var pending = lines.size
                     lines.forEach { line ->
                         lid.identifyLanguage(line.text).addOnSuccessListener { lang ->
                             val target = Locale.getDefault().language
-                            if (lang != "und" && lang != target) translate(line, lang, target)
+                            if (lang != "und" && lang != target && cachedLanguages.contains(lang)) {
+                                translate(line, lang, target, currentFrame) { item ->
+                                    if (item != null && currentFrame == frameId) translated.add(item)
+                                    pending--
+                                    if (pending <= 0 && currentFrame == frameId) {
+                                        handler.post { overlayView?.setItems(translated.toList()) }
+                                    }
+                                }
+                            } else {
+                                pending--
+                                if (pending <= 0 && currentFrame == frameId) {
+                                    handler.post { overlayView?.setItems(translated.toList()) }
+                                }
+                            }
+                        }.addOnFailureListener {
+                            pending--
+                            if (pending <= 0 && currentFrame == frameId) {
+                                handler.post { overlayView?.setItems(translated.toList()) }
+                            }
                         }
                     }
                 }
+                .addOnFailureListener { it.printStackTrace() }
                 .addOnCompleteListener {
                     recognizer.close()
                     if (!bitmap.isRecycled) bitmap.recycle()
                     busy = false
+                    refreshCachedLanguages()
                     scheduleNext()
                 }
         } catch (e: Throwable) {
@@ -123,7 +187,7 @@ class TranslatorService : Service() {
     }
 
     private fun scheduleNext() {
-        if (!stopped) handler.postDelayed(::scan, 1200)
+        if (!stopped) handler.postDelayed(::scan, 1600)
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
@@ -144,64 +208,27 @@ class TranslatorService : Service() {
                 cropped
             }
         } catch (e: Throwable) {
-            e.printStackTrace()
-            null
+            e.printStackTrace(); null
         }
     }
 
-    private fun translate(line: Text.Line, source: String, target: String) {
-        if (source == target || source == "und" || target == "und") return
+    private fun translate(line: Text.Line, source: String, target: String, frame: Long, done: (TranslationItem?) -> Unit) {
+        if (source == target || source == "und" || target == "und" || !cachedLanguages.contains(source)) {
+            done(null); return
+        }
         try {
-            val options = TranslatorOptions.Builder()
-                .setSourceLanguage(source).setTargetLanguage(target).build()
-            val translator = Translation.getClient(options)
-            translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
-                .addOnSuccessListener {
-                    translator.translate(line.text)
-                        .addOnSuccessListener { translated -> addOverlay(line, translated) }
-                        .addOnCompleteListener { translator.close() }
-                }
-                .addOnFailureListener { translator.close() }
-        } catch (e: Throwable) { e.printStackTrace() }
-    }
-
-    private fun addOverlay(line: Text.Line, text: String) {
-        if (text.isBlank() || text.equals(line.text, true) || stopped) return
-        val r = line.boundingBox ?: return
-        handler.post {
-            if (stopped) return@post
-            try {
-                val tv = TextView(this).apply {
-                    this.text = text
-                    setTextColor(Color.WHITE)
-                    setBackgroundColor(Color.argb(235, 20, 20, 20))
-                    textSize = (r.height() * 0.72f).coerceAtLeast(10f)
-                    setPadding(6, 0, 6, 0)
-                    gravity = Gravity.CENTER_VERTICAL
-                    maxLines = 2
-                    includeFontPadding = false
-                }
-                val lp = WindowManager.LayoutParams(
-                    r.width().coerceAtLeast(40), r.height().coerceAtLeast(24),
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                    PixelFormat.TRANSLUCENT
-                )
-                lp.gravity = Gravity.TOP or Gravity.START
-                lp.x = r.left; lp.y = r.top
-                overlay?.addView(tv, lp)
-                labels.add(tv)
-            } catch (e: Throwable) { e.printStackTrace() }
-        }
-    }
-
-    private fun clearOverlay() {
-        handler.post {
-            labels.toList().forEach { view ->
-                try { overlay?.removeView(view) } catch (_: Throwable) {}
+            val key = "$source->$target"
+            val translator = translators.getOrPut(key) {
+                Translation.getClient(TranslatorOptions.Builder()
+                    .setSourceLanguage(source).setTargetLanguage(target).build())
             }
-            labels.clear()
+            translator.translate(line.text)
+                .addOnSuccessListener { translated ->
+                    if (frame != frameId) done(null) else done(TranslationItem(line.boundingBox, translated))
+                }
+                .addOnFailureListener { done(null) }
+        } catch (e: Throwable) {
+            e.printStackTrace(); done(null)
         }
     }
 
@@ -224,12 +251,56 @@ class TranslatorService : Service() {
     override fun onDestroy() {
         stopped = true
         handler.removeCallbacksAndMessages(null)
-        clearOverlay()
+        try { windowManager?.removeView(overlayView) } catch (_: Throwable) {}
+        translators.values.forEach { try { it.close() } catch (_: Throwable) {} }
+        translators.clear()
         try { display?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         try { projection?.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
         try { projection?.stop() } catch (_: Throwable) {}
-        display = null; reader = null; projection = null
+        display = null; reader = null; projection = null; overlayView = null
         super.onDestroy()
+    }
+
+    data class TranslationItem(val rect: Rect?, val text: String)
+
+    private class TranslationOverlayView(context: Context) : View(context) {
+        private val items = mutableListOf<TranslationItem>()
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+            isSubpixelText = true
+        }
+
+        fun setItems(newItems: List<TranslationItem>) {
+            items.clear()
+            items.addAll(newItems.filter { it.rect != null && it.text.isNotBlank() })
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            items.forEach { item ->
+                val r = item.rect ?: return@forEach
+                val left = max(0, r.left - 5).toFloat()
+                val top = max(0, r.top - 4).toFloat()
+                val right = min(width, r.right + 5).toFloat()
+                val bottom = min(height, r.bottom + 4).toFloat()
+                bgPaint.color = Color.argb(242, 25, 25, 25)
+                canvas.drawRect(left, top, right, bottom, bgPaint)
+
+                var size = (r.height() * 0.72f).coerceIn(10f, 42f)
+                textPaint.color = Color.WHITE
+                textPaint.textSize = size
+                val maxWidth = max(40f, right - left - 10f)
+                while (textPaint.measureText(item.text) > maxWidth && size > 9f) {
+                    size -= 1f
+                    textPaint.textSize = size
+                }
+                val fm = textPaint.fontMetrics
+                val baseline = top + (bottom - top - fm.bottom - fm.top) / 2f
+                canvas.drawText(item.text, left + 5f, baseline, textPaint)
+            }
+        }
     }
 }
