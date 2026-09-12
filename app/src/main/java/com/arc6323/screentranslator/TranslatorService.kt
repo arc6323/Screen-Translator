@@ -18,6 +18,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
+import java.util.Locale
 
 class TranslatorService : Service() {
     private var projection: MediaProjection? = null
@@ -52,19 +53,21 @@ class TranslatorService : Service() {
             } ?: return START_NOT_STICKY
 
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = pm.getMediaProjection(code, data)
+            projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
             projection?.registerCallback(projectionCallback, handler)
 
             val dm = resources.displayMetrics
             val width = dm.widthPixels
             val height = dm.heightPixels
+            display?.release()
             reader?.close()
             reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
             display = projection?.createVirtualDisplay(
                 "ScreenTranslator", width, height, dm.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader!!.surface, null, handler
-            )
+            ) ?: throw IllegalStateException("Virtual display unavailable")
+
             handler.removeCallbacksAndMessages(null)
             handler.postDelayed(::scan, 1200)
         } catch (e: Throwable) {
@@ -96,6 +99,7 @@ class TranslatorService : Service() {
                 .addOnSuccessListener { result ->
                     clearOverlay()
                     val lines = result.textBlocks.flatMap { it.lines }.take(30)
+                    if (lines.isEmpty()) return@addOnSuccessListener
                     val lid = LanguageIdentification.getClient()
                     lines.forEach { line ->
                         lid.identifyLanguage(line.text).addOnSuccessListener { lang ->
@@ -128,6 +132,7 @@ class TranslatorService : Service() {
             val buffer = plane.buffer
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
+            if (pixelStride <= 0 || rowStride < pixelStride * image.width) return null
             val rowPadding = rowStride - pixelStride * image.width
             val paddedWidth = image.width + rowPadding / pixelStride
             buffer.rewind()
