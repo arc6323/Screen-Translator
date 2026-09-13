@@ -12,8 +12,6 @@ object LanguageCacheManager {
     private const val KEY_LANGUAGES = "cached_languages"
     private const val KEY_DEFAULTS_MIGRATED = "defaults_migrated"
 
-    // ML Kit translation models are roughly 30 MB each. ML Kit does not expose
-    // byte-level download progress, so the UI reports an estimated speed.
     private const val ESTIMATED_MODEL_MB = 30.0
 
     data class Language(val code: String, val name: String)
@@ -24,7 +22,8 @@ object LanguageCacheManager {
         val currentCode: String? = null,
         val currentName: String? = null,
         val elapsedMs: Long = 0L,
-        val completedModelCount: Int = 0
+        val completedModelCount: Int = 0,
+        val errorMessage: String? = null
     )
 
     val languages = listOf(
@@ -43,11 +42,9 @@ object LanguageCacheManager {
 
     private val supportedCodes = languages.map { it.code }.toSet()
 
-    /** Returns the phone's system language, not a possible per-app language override. */
     fun targetLanguage(context: Context): String {
         val locale = if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val manager = context.getSystemService(android.app.LocaleManager::class.java)
-            manager?.systemLocales?.get(0)
+            context.getSystemService(android.app.LocaleManager::class.java)?.systemLocales?.get(0)
         } else if (android.os.Build.VERSION.SDK_INT >= 24) {
             android.os.LocaleList.getDefault().get(0)
         } else {
@@ -67,7 +64,6 @@ object LanguageCacheManager {
         val current = prefs.getStringSet(KEY_LANGUAGES, null)?.toMutableSet()
         if (!prefs.getBoolean(KEY_DEFAULTS_MIGRATED, false)) {
             val migrated = (current ?: emptySet()).toMutableSet().apply {
-                // These two are always available by default. English is built into ML Kit.
                 add("ru")
                 add("en")
             }
@@ -82,7 +78,6 @@ object LanguageCacheManager {
 
     fun saveSelected(context: Context, codes: Set<String>) {
         val valid = codes.filter { it in supportedCodes }.toMutableSet().apply {
-            // Russian + English are the built-in/default pair and cannot be disabled.
             add("ru")
             add("en")
         }
@@ -94,10 +89,6 @@ object LanguageCacheManager {
     }
 
     fun isDownloaded(code: String, callback: (Boolean) -> Unit) {
-        if (code == "en") {
-            callback(true)
-            return
-        }
         val language = TranslateLanguage.fromLanguageTag(code)
         if (language == null) {
             callback(false)
@@ -114,22 +105,17 @@ object LanguageCacheManager {
         context: Context,
         callback: (DownloadState) -> Unit = {}
     ) {
-        val required = (selected(context) + targetLanguage(context))
+        // Always keep Russian + English ready. Other selected languages are downloaded on demand.
+        val required = (selected(context) + "ru" + "en" + targetLanguage(context))
             .filter { it in supportedCodes }
             .distinct()
 
-        // English is bundled into the translation runtime. It is not a downloadable
-        // remote model, so only real dynamic models are counted as downloads.
-        val dynamicCodes = required.filter { it != "en" }
-        if (dynamicCodes.isEmpty()) {
-            pruneUnused(RemoteModelManager.getInstance(), required.toSet())
-            callback(DownloadState(0, 0, 0))
-            return
-        }
-
         val manager = RemoteModelManager.getInstance()
-        val conditions = DownloadConditions.Builder().requireWifi().build()
-        downloadNext(context, manager, conditions, dynamicCodes, 0, 0, callback)
+        // ML Kit translation models are downloaded dynamically. Do not force Wi-Fi here:
+        // otherwise the download silently remains pending on networks Android does not classify
+        // as Wi-Fi. The UI shows that the models are about 30 MB each.
+        val conditions = DownloadConditions.Builder().build()
+        downloadNext(context, manager, conditions, required, 0, 0, callback)
     }
 
     private fun downloadNext(
@@ -142,27 +128,27 @@ object LanguageCacheManager {
         callback: (DownloadState) -> Unit
     ) {
         if (index >= codes.size) {
-            pruneUnused(manager, (selected(context) + targetLanguage(context)).toSet())
+            pruneUnused(manager, (selected(context) + "ru" + "en" + targetLanguage(context)).toSet())
             callback(DownloadState(codes.size, codes.size, failed))
             return
         }
 
         val code = codes[index]
         val language = TranslateLanguage.fromLanguageTag(code)
+        val name = languages.firstOrNull { it.code == code }?.name ?: code
         if (language == null) {
-            callback(DownloadState(index + 1, codes.size, failed + 1, code))
+            callback(DownloadState(index + 1, codes.size, failed + 1, code, name, 0L, 0, "Язык не поддерживается ML Kit"))
             downloadNext(context, manager, conditions, codes, index + 1, failed + 1, callback)
             return
         }
 
         val model = TranslateRemoteModel.Builder(language).build()
         val startedAt = System.currentTimeMillis()
-        val name = languages.firstOrNull { it.code == code }?.name ?: code
 
         manager.isModelDownloaded(model)
             .addOnSuccessListener { alreadyDownloaded ->
                 if (alreadyDownloaded) {
-                    callback(DownloadState(index + 1, codes.size, failed, code, name, 0L, 0))
+                    callback(DownloadState(index + 1, codes.size, failed, code, name, 0L, 1))
                     downloadNext(context, manager, conditions, codes, index + 1, failed, callback)
                     return@addOnSuccessListener
                 }
@@ -174,14 +160,17 @@ object LanguageCacheManager {
                         callback(DownloadState(index + 1, codes.size, failed, code, name, elapsed, 1))
                         downloadNext(context, manager, conditions, codes, index + 1, failed, callback)
                     }
-                    .addOnFailureListener {
+                    .addOnFailureListener { error ->
                         val elapsed = System.currentTimeMillis() - startedAt
-                        callback(DownloadState(index + 1, codes.size, failed + 1, code, name, elapsed, 0))
+                        val message = error.localizedMessage ?: error.javaClass.simpleName
+                        callback(DownloadState(index + 1, codes.size, failed + 1, code, name, elapsed, 0, message))
                         downloadNext(context, manager, conditions, codes, index + 1, failed + 1, callback)
                     }
             }
-            .addOnFailureListener {
-                callback(DownloadState(index + 1, codes.size, failed + 1, code, name, System.currentTimeMillis() - startedAt, 0))
+            .addOnFailureListener { error ->
+                val elapsed = System.currentTimeMillis() - startedAt
+                val message = error.localizedMessage ?: error.javaClass.simpleName
+                callback(DownloadState(index + 1, codes.size, failed + 1, code, name, elapsed, 0, message))
                 downloadNext(context, manager, conditions, codes, index + 1, failed + 1, callback)
             }
     }
@@ -189,7 +178,7 @@ object LanguageCacheManager {
     private fun pruneUnused(manager: RemoteModelManager, required: Set<String>) {
         manager.getDownloadedModels(TranslateRemoteModel::class.java)
             .addOnSuccessListener { models ->
-                models.filter { it.language !in required && it.language != "en" }
+                models.filter { it.language !in required }
                     .forEach { manager.deleteDownloadedModel(it) }
             }
     }
