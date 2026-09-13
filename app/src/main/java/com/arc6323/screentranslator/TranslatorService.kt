@@ -2,6 +2,7 @@ package com.arc6323.screentranslator
 
 import android.app.*
 import android.content.*
+import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.hardware.display.DisplayManager
 import android.media.*
@@ -58,10 +59,6 @@ class TranslatorService : Service() {
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             if (stopped || replacingProjection) return
-            // Another screen-capture application can take over the device's active
-            // MediaProjection session. Android does not provide a way for two ordinary
-            // apps to share the same screen-capture session. Keep our service alive,
-            // release the dead capture resources, and let the user restart capture later.
             projectionLost = true
             releaseCaptureResources(clearOverlay = true)
             updateNotification("Захват экрана занят другим приложением")
@@ -71,7 +68,6 @@ class TranslatorService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        startForeground(7, notification("Live-перевод экрана включён"))
         overlayWindow = getSystemService(WINDOW_SERVICE) as WindowManager
         latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         chinese = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -99,6 +95,17 @@ class TranslatorService : Service() {
             val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
             else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
             if (data == null) return START_NOT_STICKY
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    7,
+                    notification("Подготовка захвата экрана…"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                @Suppress("DEPRECATION") startForeground(7, notification("Подготовка захвата экрана…"))
+            }
+
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             replacingProjection = true
             try {
@@ -145,14 +152,12 @@ class TranslatorService : Service() {
             val bitmap = imageToBitmap(image)
             image.close(); image = null
             if (bitmap == null) { busy = false; scheduleNext(); return }
-
             val selected = LanguageCacheManager.selected(this)
             val recognizers = mutableListOf<TextRecognizer>(latin)
             if ("zh" in selected) recognizers.add(chinese)
             if ("hi" in selected) recognizers.add(devanagari)
             if ("ja" in selected) recognizers.add(japanese)
             if ("ko" in selected) recognizers.add(korean)
-
             val allLines = java.util.Collections.synchronizedList(mutableListOf<Text.Line>())
             val pendingRecognizers = AtomicInteger(recognizers.size)
             recognizers.forEach { recognizer ->
@@ -193,9 +198,7 @@ class TranslatorService : Service() {
                             if (translated != null) items.add(OverlayView.Item(Rect(rect), translated, background))
                             completeLine(pending, items, thisGeneration)
                         }
-                    } else {
-                        completeLine(pending, items, thisGeneration)
-                    }
+                    } else completeLine(pending, items, thisGeneration)
                 }
                 .addOnFailureListener { completeLine(pending, items, thisGeneration) }
         }
@@ -276,11 +279,7 @@ class TranslatorService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        if (Build.VERSION.SDK_INT >= 26) {
-            getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
-        } else {
-            getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
-        }
+        getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
     }
 
     private fun imageToBitmap(image: Image): Bitmap? {
