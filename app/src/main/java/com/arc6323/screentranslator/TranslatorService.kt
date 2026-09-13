@@ -39,6 +39,8 @@ class TranslatorService : Service() {
     private var busy = false
     private var stopped = false
     private var generation = 0L
+    private var replacingProjection = false
+    private var projectionLost = false
 
     private lateinit var latin: TextRecognizer
     private lateinit var chinese: TextRecognizer
@@ -54,13 +56,22 @@ class TranslatorService : Service() {
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() { stopSelf() }
+        override fun onStop() {
+            if (stopped || replacingProjection) return
+            // Another screen-capture application can take over the device's active
+            // MediaProjection session. Android does not provide a way for two ordinary
+            // apps to share the same screen-capture session. Keep our service alive,
+            // release the dead capture resources, and let the user restart capture later.
+            projectionLost = true
+            releaseCaptureResources(clearOverlay = true)
+            updateNotification("Захват экрана занят другим приложением")
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        startForeground(7, notification())
+        startForeground(7, notification("Live-перевод экрана включён"))
         overlayWindow = getSystemService(WINDOW_SERVICE) as WindowManager
         latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         chinese = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -89,17 +100,22 @@ class TranslatorService : Service() {
             else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
             if (data == null) return START_NOT_STICKY
             val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection?.let { old ->
-                try { old.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
-                try { old.stop() } catch (_: Throwable) {}
+            replacingProjection = true
+            try {
+                projection?.let { old ->
+                    try { old.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
+                    try { old.stop() } catch (_: Throwable) {}
+                }
+            } finally {
+                replacingProjection = false
             }
+            releaseCaptureResources(clearOverlay = false)
+            projectionLost = false
             projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
             projection?.registerCallback(projectionCallback, handler)
             val dm = resources.displayMetrics
             val width = dm.widthPixels
             val height = dm.heightPixels
-            display?.release()
-            reader?.close()
             reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
             display = projection?.createVirtualDisplay(
                 "ScreenTranslator", width, height, dm.densityDpi,
@@ -109,15 +125,17 @@ class TranslatorService : Service() {
             generation++
             handler.removeCallbacksAndMessages(null)
             handler.postDelayed(::scan, 1000)
+            updateNotification("Live-перевод экрана включён")
         } catch (e: Throwable) {
             e.printStackTrace()
-            stopSelf()
+            releaseCaptureResources(clearOverlay = true)
+            updateNotification("Не удалось получить захват экрана")
         }
         return START_NOT_STICKY
     }
 
     private fun scan() {
-        if (stopped || busy) { scheduleNext(); return }
+        if (stopped || projectionLost || busy) { if (!stopped && !projectionLost) scheduleNext(); return }
         var image: Image? = null
         val thisGeneration = ++generation
         try {
@@ -171,7 +189,7 @@ class TranslatorService : Service() {
             languageId.identifyLanguage(line.text)
                 .addOnSuccessListener { source ->
                     if (rect.width() > 0 && rect.height() > 0 && source in selected && source != target) {
-                        translateLine(line.text, source, target, thisGeneration, background) { translated ->
+                        translateLine(line.text, source, target, thisGeneration) { translated ->
                             if (translated != null) items.add(OverlayView.Item(Rect(rect), translated, background))
                             completeLine(pending, items, thisGeneration)
                         }
@@ -202,7 +220,7 @@ class TranslatorService : Service() {
     private fun completeLine(pending: AtomicInteger, items: MutableList<OverlayView.Item>, thisGeneration: Long) {
         if (pending.decrementAndGet() == 0) {
             handler.post {
-                if (!stopped && thisGeneration == generation) {
+                if (!stopped && !projectionLost && thisGeneration == generation) {
                     overlayView?.setItems(items.sortedWith(compareBy({ it.rect.top }, { it.rect.left })))
                 }
             }
@@ -211,8 +229,8 @@ class TranslatorService : Service() {
         }
     }
 
-    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, background: Int, done: (String?) -> Unit) {
-        if (thisGeneration != generation) { done(null); return }
+    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, done: (String?) -> Unit) {
+        if (thisGeneration != generation || projectionLost) { done(null); return }
         val key = "$source|$target|$text"
         translationCache[key]?.let { done(it); return }
         try {
@@ -223,7 +241,7 @@ class TranslatorService : Service() {
             fun translateNow() {
                 translator.translate(text)
                     .addOnSuccessListener { translated ->
-                        if (thisGeneration == generation && translated.isNotBlank()) {
+                        if (thisGeneration == generation && !projectionLost && translated.isNotBlank()) {
                             translationCache[key] = translated
                             done(translated)
                         } else done(null)
@@ -243,7 +261,27 @@ class TranslatorService : Service() {
         scheduleNext()
     }
 
-    private fun scheduleNext() { if (!stopped) handler.postDelayed(::scan, 1600) }
+    private fun scheduleNext() { if (!stopped && !projectionLost) handler.postDelayed(::scan, 1600) }
+
+    private fun releaseCaptureResources(clearOverlay: Boolean) {
+        handler.removeCallbacks(::scan)
+        busy = false
+        generation++
+        try { display?.release() } catch (_: Throwable) {}
+        try { reader?.close() } catch (_: Throwable) {}
+        display = null
+        reader = null
+        projection = null
+        if (clearOverlay) overlayView?.setItems(emptyList())
+    }
+
+    private fun updateNotification(text: String) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
+        } else {
+            getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
+        }
+    }
 
     private fun imageToBitmap(image: Image): Bitmap? {
         return try {
@@ -269,9 +307,9 @@ class TranslatorService : Service() {
         }
     }
 
-    private fun notification(): Notification = Notification.Builder(this, "translator")
+    private fun notification(text: String): Notification = Notification.Builder(this, "translator")
         .setContentTitle("Screen Translator")
-        .setContentText("Live-перевод экрана включён")
+        .setContentText(text)
         .setSmallIcon(android.R.drawable.ic_menu_search)
         .setOngoing(true)
         .build()
