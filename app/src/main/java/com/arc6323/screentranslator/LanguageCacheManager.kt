@@ -11,8 +11,9 @@ object LanguageCacheManager {
     private const val PREFS = "translator_prefs"
     private const val KEY_LANGUAGES = "cached_languages"
     private const val KEY_DEFAULTS_MIGRATED = "defaults_migrated"
+    const val ESTIMATED_MODEL_MB = 30.0
 
-    private const val ESTIMATED_MODEL_MB = 30.0
+    @Volatile private var paused = false
 
     data class Language(val code: String, val name: String)
     data class DownloadState(
@@ -23,7 +24,9 @@ object LanguageCacheManager {
         val currentName: String? = null,
         val elapsedMs: Long = 0L,
         val completedModelCount: Int = 0,
-        val errorMessage: String? = null
+        val errorMessage: String? = null,
+        val downloading: Boolean = false,
+        val paused: Boolean = false
     )
 
     val languages = listOf(
@@ -89,6 +92,11 @@ object LanguageCacheManager {
     }
 
     fun isDownloaded(code: String, callback: (Boolean) -> Unit) {
+        // English is bundled in ML Kit translation and is ready without a remote download.
+        if (code == "en") {
+            callback(true)
+            return
+        }
         val language = TranslateLanguage.fromLanguageTag(code)
         if (language == null) {
             callback(false)
@@ -101,21 +109,30 @@ object LanguageCacheManager {
             .addOnFailureListener { callback(false) }
     }
 
+    fun setPaused(value: Boolean) {
+        paused = value
+    }
+
+    fun isPaused(): Boolean = paused
+
     fun prepareSelected(
         context: Context,
         callback: (DownloadState) -> Unit = {}
     ) {
-        // Always keep Russian + English ready. Other selected languages are downloaded on demand.
-        val required = (selected(context) + "ru" + "en" + targetLanguage(context))
+        prepareCodes(context, selected(context), callback)
+    }
+
+    fun prepareCodes(
+        context: Context,
+        requested: Set<String>,
+        callback: (DownloadState) -> Unit = {}
+    ) {
+        // English is bundled. Russian is the mandatory remote model for the default RU target.
+        val required = (requested + "ru" + "en" + targetLanguage(context))
             .filter { it in supportedCodes }
             .distinct()
-
-        val manager = RemoteModelManager.getInstance()
-        // ML Kit translation models are downloaded dynamically. Do not force Wi-Fi here:
-        // otherwise the download silently remains pending on networks Android does not classify
-        // as Wi-Fi. The UI shows that the models are about 30 MB each.
-        val conditions = DownloadConditions.Builder().build()
-        downloadNext(context, manager, conditions, required, 0, 0, callback)
+        paused = false
+        downloadNext(context, RemoteModelManager.getInstance(), DownloadConditions.Builder().build(), required, 0, 0, callback)
     }
 
     private fun downloadNext(
@@ -127,6 +144,10 @@ object LanguageCacheManager {
         failed: Int,
         callback: (DownloadState) -> Unit
     ) {
+        if (paused) {
+            callback(DownloadState(index, codes.size, failed, paused = true))
+            return
+        }
         if (index >= codes.size) {
             pruneUnused(manager, (selected(context) + "ru" + "en" + targetLanguage(context)).toSet())
             callback(DownloadState(codes.size, codes.size, failed))
@@ -134,26 +155,34 @@ object LanguageCacheManager {
         }
 
         val code = codes[index]
+        // English is already part of the ML Kit translation runtime.
+        if (code == "en") {
+            callback(DownloadState(index + 1, codes.size, failed, code, "English", completedModelCount = 1))
+            downloadNext(context, manager, conditions, codes, index + 1, failed, callback)
+            return
+        }
+
         val language = TranslateLanguage.fromLanguageTag(code)
         val name = languages.firstOrNull { it.code == code }?.name ?: code
         if (language == null) {
-            callback(DownloadState(index + 1, codes.size, failed + 1, code, name, 0L, 0, "Язык не поддерживается ML Kit"))
+            callback(DownloadState(index + 1, codes.size, failed + 1, code, name, errorMessage = "Язык не поддерживается ML Kit"))
             downloadNext(context, manager, conditions, codes, index + 1, failed + 1, callback)
             return
         }
 
         val model = TranslateRemoteModel.Builder(language).build()
         val startedAt = System.currentTimeMillis()
-
         manager.isModelDownloaded(model)
             .addOnSuccessListener { alreadyDownloaded ->
                 if (alreadyDownloaded) {
-                    callback(DownloadState(index + 1, codes.size, failed, code, name, 0L, 1))
+                    callback(DownloadState(index + 1, codes.size, failed, code, name, completedModelCount = 1))
                     downloadNext(context, manager, conditions, codes, index + 1, failed, callback)
                     return@addOnSuccessListener
                 }
 
-                callback(DownloadState(index, codes.size, failed, code, name, 0L, 0))
+                // There is no byte-level progress callback in Android RemoteModelManager.
+                // Keep the UI indeterminate instead of showing a false 0% for the whole download.
+                callback(DownloadState(index, codes.size, failed, code, name, downloading = true))
                 manager.download(model, conditions)
                     .addOnSuccessListener {
                         val elapsed = System.currentTimeMillis() - startedAt
@@ -168,9 +197,8 @@ object LanguageCacheManager {
                     }
             }
             .addOnFailureListener { error ->
-                val elapsed = System.currentTimeMillis() - startedAt
                 val message = error.localizedMessage ?: error.javaClass.simpleName
-                callback(DownloadState(index + 1, codes.size, failed + 1, code, name, elapsed, 0, message))
+                callback(DownloadState(index + 1, codes.size, failed + 1, code, name, System.currentTimeMillis() - startedAt, errorMessage = message))
                 downloadNext(context, manager, conditions, codes, index + 1, failed + 1, callback)
             }
     }
