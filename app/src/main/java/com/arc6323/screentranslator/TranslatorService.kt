@@ -1,410 +1,440 @@
 package com.arc6323.screentranslator
 
+import android.Manifest
 import android.app.*
-import android.content.*
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.*
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.graphics.Point
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
-import android.media.*
+import android.hardware.display.VirtualDisplay
+import android.hardware.input.InputManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
-import android.view.*
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.Text
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.TextRecognizer
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
-import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
-import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
-import com.google.mlkit.nl.languageid.LanguageIdentification
-import com.google.mlkit.nl.languageid.LanguageIdentifier
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
-import java.util.LinkedHashMap
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.max
+import android.provider.Settings
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.*
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class TranslatorService : Service() {
-    private var projection: MediaProjection? = null
-    private var reader: ImageReader? = null
-    private var display: android.hardware.display.VirtualDisplay? = null
-    private var overlayWindow: WindowManager? = null
-    private var overlayView: OverlayView? = null
-    private val handler = Handler(Looper.getMainLooper())
-    private var busy = false
-    private var stopped = false
-    private var generation = 0L
-    private var replacingProjection = false
-    private var projectionLost = false
-
-    private lateinit var latin: TextRecognizer
-    private lateinit var chinese: TextRecognizer
-    private lateinit var devanagari: TextRecognizer
-    private lateinit var japanese: TextRecognizer
-    private lateinit var korean: TextRecognizer
-    private lateinit var languageId: LanguageIdentifier
-
-    private val translators = mutableMapOf<String, Translator>()
-    private val readyPairs = mutableSetOf<String>()
-    private val preparingPairs = mutableSetOf<String>()
-    private val translationCache = object : LinkedHashMap<String, String>(300, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 300
+    companion object {
+        const val ACTION_START = "com.arc6323.screentranslator.START"
+        const val ACTION_STOP = "com.arc6323.screentranslator.STOP"
+        const val ACTION_TOGGLE = "com.arc6323.screentranslator.TOGGLE"
+        private const val CHANNEL = "translator"
+        private const val NOTIFICATION_ID = 7
     }
-
-    private val projectionCallback = object : MediaProjection.Callback() {
+    private val main = Handler(Looper.getMainLooper())
+    private val frames = FrameGuard()
+    private lateinit var capture: CaptureEngine
+    private lateinit var analyzer: FrameAnalyzer
+    private lateinit var window: WindowManager
+    private var projection: MediaProjection? = null
+    private var display: VirtualDisplay? = null
+    private var overlay: OverlayView? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
+    private var controls: LinearLayout? = null
+    private var modeButton: Button? = null
+    private var detail: AlertDialog? = null
+    private var frozen = false
+    private var freezeRequested = false
+    private var stopping = false
+    private var stopMessage = "Перевод выключен"
+    private var lastNotification = ""
+    private var screenWidth = 1
+    private var screenHeight = 1
+    private var captureWidth = 1
+    private var captureHeight = 1
+    private var translatedItems = emptyList<OverlayView.Item>()
+    private val scanTask = Runnable { scan() }
+    private val resizeTask = Runnable { resizeCapture() }
+    private val callback = object : MediaProjection.Callback() {
         override fun onStop() {
-            if (stopped || replacingProjection) return
-            projectionLost = true
-            releaseCaptureResources(clearOverlay = true)
-            updateNotification("Захват экрана занят другим приложением")
+            if (!stopping) stopWithMessage("Захват экрана остановлен. Включите перевод снова.")
+        }
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            main.removeCallbacks(resizeTask)
+            main.postDelayed(resizeTask, 120)
+        }
+        override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+            if (!isVisible && !frozen) {
+                frames.invalidate()
+                overlay?.setItems(emptyList())
+                translatedItems = emptyList()
+            }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
-        overlayWindow = getSystemService(WINDOW_SERVICE) as WindowManager
-        latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        chinese = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-        devanagari = TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
-        japanese = TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
-        korean = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-        languageId = LanguageIdentification.getClient()
-        overlayView = OverlayView(this)
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
+        window = getSystemService(WINDOW_SERVICE) as WindowManager
+        LanguageCacheManager.initialize(this)
+        capture = CaptureEngine(main, ::onSceneChanged)
+        analyzer = FrameAnalyzer()
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL, "Перевод экрана", NotificationManager.IMPORTANCE_LOW)
         )
-        try { overlayWindow?.addView(overlayView, lp) } catch (e: Throwable) { e.printStackTrace() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (stopped) return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> { stopWithMessage("Перевод выключен"); return START_NOT_STICKY }
+            ACTION_TOGGLE -> {
+                if (projection != null) toggleMode() else stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        if (projection != null || stopping) return START_NOT_STICKY
         try {
-            val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
-            val data = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra("data", Intent::class.java)
-            else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>("data")
-            if (data == null) return START_NOT_STICKY
-
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(
-                    7,
-                    notification("Подготовка захвата экрана…"),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                )
-            } else {
-                @Suppress("DEPRECATION") startForeground(7, notification("Подготовка захвата экрана…"))
+            val data = if (Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("data", Intent::class.java)
+            else @Suppress("DEPRECATION") intent?.getParcelableExtra<Intent>("data")
+            val result = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+            if (result != Activity.RESULT_OK || data == null) {
+                stopWithMessage("Для запуска требуется разрешение захвата экрана.")
+                return START_NOT_STICKY
             }
-
-            val pm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            replacingProjection = true
-            try {
-                projection?.let { old ->
-                    try { old.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
-                    try { old.stop() } catch (_: Throwable) {}
-                }
-            } finally {
-                replacingProjection = false
+            if (!Settings.canDrawOverlays(this)) {
+                stopWithMessage("Разрешите отображение поверх приложений.")
+                return START_NOT_STICKY
             }
-            releaseCaptureResources(clearOverlay = false)
-            projectionLost = false
-            projection = pm.getMediaProjection(code, data) ?: throw IllegalStateException("MediaProjection unavailable")
-            projection?.registerCallback(projectionCallback, handler)
-            val dm = resources.displayMetrics
-            val width = dm.widthPixels
-            val height = dm.heightPixels
-            overlayView?.setCaptureSize(width, height)
-            reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            if (Build.VERSION.SDK_INT >= 29) startForeground(
+                NOTIFICATION_ID, notification("Подготовка перевода…"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            ) else startForeground(NOTIFICATION_ID, notification("Подготовка перевода…"))
+            projection = (getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager)
+                .getMediaProjection(Activity.RESULT_OK, data)
+            projection?.registerCallback(callback, main)
+            updateDimensions()
+            val surface = capture.attach(captureWidth, captureHeight)
             display = projection?.createVirtualDisplay(
-                "ScreenTranslator", width, height, dm.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader!!.surface, null, handler
-            ) ?: throw IllegalStateException("Virtual display unavailable")
-            generation++
-            handler.removeCallbacksAndMessages(null)
-            overlayView?.visibility = View.VISIBLE
-            handler.postDelayed(::scan, 700)
-            updateNotification("Live-перевод экрана включён")
-        } catch (e: Throwable) {
-            e.printStackTrace()
-            releaseCaptureResources(clearOverlay = true)
-            updateNotification("Не удалось получить захват экрана")
+                "ScreenTranslator", captureWidth, captureHeight, resources.displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, main
+            ) ?: error("Capture display unavailable")
+            createWindows()
+            frames.start()
+            setStatus("Live-перевод включён")
+            schedule(200)
+        } catch (_: Exception) {
+            stopWithMessage("Не удалось запустить захват. Откройте приложение и попробуйте снова.")
         }
         return START_NOT_STICKY
     }
 
+    private fun updateDimensions() {
+        val bounds = if (Build.VERSION.SDK_INT >= 30) window.maximumWindowMetrics.bounds else {
+            val size = Point()
+            @Suppress("DEPRECATION")
+            window.defaultDisplay.getRealSize(size)
+            Rect(0, 0, size.x, size.y)
+        }
+        screenWidth = bounds.width().coerceAtLeast(1)
+        screenHeight = bounds.height().coerceAtLeast(1)
+        val scale = min(1f, 1920f / maxOf(screenWidth, screenHeight))
+        captureWidth = (screenWidth * scale).roundToInt().coerceAtLeast(1)
+        captureHeight = (screenHeight * scale).roundToInt().coerceAtLeast(1)
+    }
+
+    private fun createWindows() {
+        val view = OverlayView(this).apply {
+            setCaptureSize(captureWidth, captureHeight, screenWidth, screenHeight)
+            setOnClickListener { if (frozen) showFullText() }
+        }
+        val params = WindowManager.LayoutParams(
+            -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            alpha = liveAlpha()
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+            if (Build.VERSION.SDK_INT >= 30) setFitInsetsTypes(0)
+        }
+        overlay = view
+        overlayParams = params
+        window.addView(view, params)
+        controls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xEE202536.toInt())
+            modeButton = Button(this@TranslatorService).apply {
+                text = "Снимок"
+                isAllCaps = false
+                minHeight = dp(48)
+                setOnClickListener { toggleMode() }
+            }
+            addView(modeButton)
+            addView(Button(this@TranslatorService).apply {
+                text = "×"
+                contentDescription = "Остановить перевод"
+                minWidth = dp(48)
+                minHeight = dp(48)
+                setOnClickListener { stopWithMessage("Перевод выключен") }
+            })
+        }
+        window.addView(controls, WindowManager.LayoutParams(
+            -2, -2, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = dp(8)
+            y = dp(8)
+        })
+        controls?.post { updateMasks() }
+    }
+
+    private fun liveAlpha(): Float = if (Build.VERSION.SDK_INT >= 31) {
+        min(0.8f, getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch)
+    } else 0.8f
+
     private fun scan() {
-        if (stopped || projectionLost || busy) {
-            if (!stopped && !projectionLost) scheduleNext()
-            return
-        }
-        busy = true
-        val thisGeneration = ++generation
-
-        // The overlay is itself visible on the captured display. Hide it for one frame
-        // so OCR never translates its own Russian output over and over again.
-        overlayView?.visibility = View.INVISIBLE
-        handler.postDelayed({ captureFrame(thisGeneration) }, 70)
-    }
-
-    private fun captureFrame(thisGeneration: Long) {
-        if (stopped || projectionLost || thisGeneration != generation) {
-            overlayView?.visibility = View.VISIBLE
-            busy = false
-            return
-        }
-        var image: Image? = null
-        try {
-            image = reader?.acquireLatestImage()
-            overlayView?.visibility = View.VISIBLE
-            if (image == null) {
-                busy = false
-                scheduleNext()
-                return
+        if (stopping || frozen || projection == null) return
+        if (analyzer.isBusy) { schedule(120); return }
+        val token = frames.begin() ?: return
+        val snapshotRequested = freezeRequested
+        val timeout = Runnable {
+            if (frames.finish(token)) {
+                capture.cancel(token)
+                restoreWindows()
+                setStatus("Обработка заняла слишком много времени. Повторяем…")
+                if (!frozen) schedule(300)
             }
-            val bitmap = imageToBitmap(image)
-            image.close()
-            image = null
-            if (bitmap == null) {
-                busy = false
-                scheduleNext()
-                return
+        }
+        main.postDelayed(timeout, 5000)
+        capture.request(token, prepared = {
+            if (frames.accepts(token)) {
+                overlay?.visibility = View.INVISIBLE
+                controls?.visibility = View.INVISIBLE
+                overlay?.postOnAnimation {
+                    overlay?.postOnAnimation {
+                        if (frames.accepts(token)) capture.arm(token)
+                    }
+                }
+            } else capture.cancel(token)
+        }, result = { bitmap ->
+            if (!frames.accepts(token)) {
+                bitmap.recycle()
+                return@request
             }
-
+            if (snapshotRequested) {
+                frozen = true
+                freezeRequested = false
+                translatedItems = emptyList()
+                overlay?.setItems(emptyList())
+                overlay?.setSnapshot(bitmap.copy(Bitmap.Config.ARGB_8888, false))
+                capture.stopMonitoring()
+                applyMode()
+            }
+            restoreWindows()
             val selected = LanguageCacheManager.selected(this)
-            val recognizers = mutableListOf<TextRecognizer>(latin)
-            if ("zh" in selected) recognizers.add(chinese)
-            if ("hi" in selected) recognizers.add(devanagari)
-            if ("ja" in selected) recognizers.add(japanese)
-            if ("ko" in selected) recognizers.add(korean)
-            val allLines = java.util.Collections.synchronizedList(mutableListOf<Text.Line>())
-            val pendingRecognizers = AtomicInteger(recognizers.size)
-            recognizers.forEach { recognizer ->
-                recognizer.process(InputImage.fromBitmap(bitmap, 0))
-                    .addOnSuccessListener { result -> allLines.addAll(result.textBlocks.flatMap { it.lines }) }
-                    .addOnCompleteListener {
-                        if (pendingRecognizers.decrementAndGet() == 0) {
-                            processLines(bitmap, allLines.distinctBy { "${it.text}|${it.boundingBox}" }, selected, thisGeneration)
-                        }
-                    }
+            val target = LanguageCacheManager.targetLanguage(this)
+            analyzer.analyze(bitmap, selected, target, current = { frames.accepts(token) }) { result ->
+                if (frames.finish(token)) {
+                    main.removeCallbacks(timeout)
+                    translatedItems = result.items
+                    overlay?.setItems(result.items)
+                    updateMasks()
+                    val message = result.error ?: if (frozen) {
+                        "Снимок готов • нажмите на экран, чтобы прочитать весь перевод"
+                    } else if (result.items.isEmpty()) "Ищем текст для перевода…" else "Live-перевод включён"
+                    setStatus(message, result.elapsedMs)
+                    if (!frozen) schedule(if (freezeRequested) 0 else if (result.unchanged) 650 else 180)
+                }
             }
-        } catch (e: Throwable) {
-            e.printStackTrace()
-            try { image?.close() } catch (_: Throwable) {}
-            overlayView?.visibility = View.VISIBLE
-            busy = false
-            scheduleNext()
+        })
+    }
+
+    private fun toggleMode() {
+        if (stopping) return
+        if (frozen) {
+            detail?.dismiss()
+            detail = null
+            frozen = false
+            freezeRequested = false
+            frames.invalidate()
+            translatedItems = emptyList()
+            overlay?.setItems(emptyList())
+            overlay?.setSnapshot(null)
+            applyMode()
+            setStatus("Live-перевод включён")
+            schedule(0)
+        } else {
+            freezeRequested = true
+            modeButton?.text = "Снимаем…"
+            setStatus("Готовим снимок для чтения…")
+            schedule(0)
         }
     }
 
-    private fun processLines(bitmap: Bitmap, rawLines: List<Text.Line>, selected: Set<String>, thisGeneration: Long) {
-        val lines = rawLines.filter {
-            val letters = it.text.count { ch -> ch.isLetter() }
-            it.text.trim().length >= 3 && letters >= 2 && it.boundingBox != null
-        }.take(24)
-        val target = LanguageCacheManager.targetLanguage(this)
-        if (lines.isEmpty()) {
-            handler.post { if (thisGeneration == generation) overlayView?.setItems(emptyList()) }
-            finishFrame(bitmap)
+    private fun applyMode() {
+        val params = overlayParams ?: return
+        params.alpha = if (frozen) 1f else liveAlpha()
+        params.flags = if (frozen) params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        else params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        overlay?.let { window.updateViewLayout(it, params) }
+        modeButton?.text = if (frozen) "Вернуться в Live" else "Снимок"
+    }
+
+    private fun restoreWindows() {
+        if (stopping) return
+        overlay?.visibility = View.VISIBLE
+        controls?.visibility = View.VISIBLE
+    }
+
+    private fun onSceneChanged() {
+        if (stopping || frozen || projection == null) return
+        frames.invalidate()
+        translatedItems = emptyList()
+        overlay?.setItems(emptyList())
+        restoreWindows()
+        updateMasks()
+        schedule(100)
+    }
+
+    private fun updateMasks() {
+        val masks = translatedItems.map { Rect(it.rect) }.toMutableList()
+        controls?.let { bar ->
+            val at = IntArray(2)
+            bar.getLocationOnScreen(at)
+            masks.add(Rect(
+                (at[0].toFloat() * captureWidth / screenWidth).toInt(),
+                (at[1].toFloat() * captureHeight / screenHeight).toInt(),
+                ((at[0] + bar.width).toFloat() * captureWidth / screenWidth).toInt(),
+                ((at[1] + bar.height).toFloat() * captureHeight / screenHeight).toInt()
+            ))
+        }
+        capture.setMasks(masks)
+    }
+
+    private fun showFullText() {
+        if (translatedItems.isEmpty()) {
+            Toast.makeText(this, "На снимке пока нет готового перевода", Toast.LENGTH_SHORT).show()
             return
         }
-
-        val items = java.util.Collections.synchronizedList(mutableListOf<OverlayView.Item>())
-        val pending = AtomicInteger(lines.size)
-        overlayView?.setItems(emptyList())
-        lines.forEach { line ->
-            val rect = line.boundingBox ?: return@forEach
-            val background = sampleBackground(bitmap, rect)
-            languageId.identifyLanguage(line.text)
-                .addOnSuccessListener { source ->
-                    // ML Kit's default language-identification threshold is 0.5.
-                    // Translate only languages explicitly enabled by the user.
-                    if (rect.width() > 0 && rect.height() > 0 && source in selected && source != target && source != "und") {
-                        translateLine(line.text.trim(), source, target, thisGeneration) { translated ->
-                            if (translated != null && translated != line.text.trim()) {
-                                items.add(OverlayView.Item(Rect(rect), translated, background))
-                            }
-                            completeLine(pending, items, thisGeneration)
-                        }
-                    } else completeLine(pending, items, thisGeneration)
-                }
-                .addOnFailureListener { completeLine(pending, items, thisGeneration) }
+        detail?.dismiss()
+        val text = TextView(this).apply {
+            this.text = translatedItems.joinToString("\n\n") { it.text }
+            textSize = 18f
+            setTextIsSelectable(true)
+            setPadding(dp(20), dp(12), dp(20), dp(12))
         }
-    }
-
-    private fun sampleBackground(bitmap: Bitmap, rect: Rect): Int {
-        val pad = max(5, min(14, rect.height() / 3))
-        val left = max(0, rect.left - pad)
-        val right = min(bitmap.width - 1, rect.right + pad)
-        val top = max(0, rect.top - pad)
-        val bottom = min(bitmap.height - 1, rect.bottom + pad)
-        var r = 0L; var g = 0L; var b = 0L; var count = 0L
-        fun add(x: Int, y: Int) {
-            val c = bitmap.getPixel(x, y)
-            r += Color.red(c); g += Color.green(c); b += Color.blue(c); count++
-        }
-        // Sample a thin border rather than the text itself.
-        for (x in left..right) { add(x, top); add(x, bottom) }
-        for (y in top..bottom) { add(left, y); add(right, y) }
-        return if (count == 0L) Color.rgb(25, 25, 25) else Color.rgb((r / count).toInt(), (g / count).toInt(), (b / count).toInt())
-    }
-
-    private fun completeLine(pending: AtomicInteger, items: MutableList<OverlayView.Item>, thisGeneration: Long) {
-        if (pending.decrementAndGet() == 0) {
-            handler.post {
-                if (!stopped && !projectionLost && thisGeneration == generation) {
-                    overlayView?.setItems(items.sortedWith(compareBy({ it.rect.top }, { it.rect.left })))
-                }
+        val scroll = ScrollView(this).apply { addView(text) }
+        detail = AlertDialog.Builder(this).setTitle("Полный перевод")
+            .setView(scroll).setPositiveButton("Закрыть", null).create().also {
+                it.window?.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+                it.show()
             }
-            busy = false
-            scheduleNext()
-        }
     }
 
-    private fun translateLine(text: String, source: String, target: String, thisGeneration: Long, done: (String?) -> Unit) {
-        if (thisGeneration != generation || projectionLost) { done(null); return }
-        val key = "$source|$target|$text"
-        translationCache[key]?.let { done(it); return }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        main.removeCallbacks(resizeTask)
+        main.postDelayed(resizeTask, 120)
+    }
+
+    private fun resizeCapture() {
+        if (stopping || display == null) return
+        val oldWidth = screenWidth
+        val oldHeight = screenHeight
+        updateDimensions()
+        if (oldWidth == screenWidth && oldHeight == screenHeight) return
+        frames.invalidate()
+        frozen = false
+        freezeRequested = false
+        detail?.dismiss()
+        detail = null
+        translatedItems = emptyList()
+        overlay?.setItems(emptyList())
+        overlay?.setSnapshot(null)
         try {
-            val sourceLanguage = com.google.mlkit.nl.translate.TranslateLanguage.fromLanguageTag(source)
-            val targetLanguage = com.google.mlkit.nl.translate.TranslateLanguage.fromLanguageTag(target)
-            if (sourceLanguage == null || targetLanguage == null) { done(null); return }
-            val pair = "$source->$target"
-            val translator = translators.getOrPut(pair) {
-                Translation.getClient(
-                    TranslatorOptions.Builder()
-                        .setSourceLanguage(sourceLanguage)
-                        .setTargetLanguage(targetLanguage)
-                        .build()
-                )
-            }
+            val surface = capture.attach(captureWidth, captureHeight)
+            display?.resize(captureWidth, captureHeight, resources.displayMetrics.densityDpi)
+            display?.surface = surface
+            overlay?.setCaptureSize(captureWidth, captureHeight, screenWidth, screenHeight)
+            applyMode()
+            restoreWindows()
+            updateMasks()
+            schedule(180)
+        } catch (_: Exception) { stopWithMessage("Не удалось обновить захват после поворота экрана.") }
+    }
 
-            fun translateNow() {
-                translator.translate(text)
-                    .addOnSuccessListener { translated ->
-                        if (thisGeneration == generation && !projectionLost && translated.isNotBlank()) {
-                            translationCache[key] = translated
-                            done(translated.trim())
-                        } else done(null)
-                    }
-                    .addOnFailureListener { done(null) }
-            }
+    private fun schedule(delayMs: Long) {
+        main.removeCallbacks(scanTask)
+        if (!stopping && !frozen && projection != null) main.postDelayed(scanTask, delayMs)
+    }
 
-            if (pair in readyPairs) {
-                translateNow()
-            } else if (pair in preparingPairs) {
-                // The first line is already downloading/preparing the pair. Avoid starting
-                // another model task for every OCR line in the same frame.
-                handler.postDelayed({ translateLine(text, source, target, thisGeneration, done) }, 180)
-            } else {
-                preparingPairs.add(pair)
-                translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
-                    .addOnSuccessListener {
-                        preparingPairs.remove(pair)
-                        readyPairs.add(pair)
-                        translateNow()
-                    }
-                    .addOnFailureListener {
-                        preparingPairs.remove(pair)
-                        done(null)
-                    }
+    private fun setStatus(message: String, elapsedMs: Long? = null) {
+        TranslationStatus.update(TranslationStatus.State(true, frozen, message, elapsedMs))
+        if (message != lastNotification) {
+            lastNotification = message
+            if (Build.VERSION.SDK_INT < 33 ||
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
             }
-        } catch (e: Throwable) {
-            e.printStackTrace()
-            done(null)
         }
     }
 
-    private fun finishFrame(bitmap: Bitmap) {
-        if (!bitmap.isRecycled) bitmap.recycle()
-        busy = false
-        scheduleNext()
+    private fun notification(message: String): Notification {
+        fun action(action: String, code: Int) = PendingIntent.getService(
+            this, code, Intent(this, TranslatorService::class.java).setAction(action),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return Notification.Builder(this, CHANNEL)
+            .setContentTitle("Screen Translator")
+            .setContentText(message)
+            .setSmallIcon(android.R.drawable.ic_menu_search)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(PendingIntent.getActivity(
+                this, 10, Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            ))
+            .addAction(Notification.Action.Builder(null, if (frozen) "Live" else "Снимок", action(ACTION_TOGGLE, 11)).build())
+            .addAction(Notification.Action.Builder(null, "Остановить", action(ACTION_STOP, 12)).build())
+            .build()
     }
 
-    private fun scheduleNext() {
-        if (!stopped && !projectionLost) handler.postDelayed(::scan, 900)
+    private fun stopWithMessage(message: String) {
+        stopMessage = message
+        stopping = true
+        frames.stop()
+        TranslationStatus.update(TranslationStatus.State(message = message))
+        stopSelf()
     }
-
-    private fun releaseCaptureResources(clearOverlay: Boolean) {
-        handler.removeCallbacks(::scan)
-        busy = false
-        generation++
-        try { display?.release() } catch (_: Throwable) {}
-        try { reader?.close() } catch (_: Throwable) {}
-        display = null
-        reader = null
-        projection = null
-        if (clearOverlay) {
-            overlayView?.setItems(emptyList())
-            overlayView?.visibility = View.VISIBLE
-        }
-    }
-
-    private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)?.notify(7, notification(text))
-    }
-
-    private fun imageToBitmap(image: Image): Bitmap? {
-        return try {
-            val plane = image.planes[0]
-            val buffer = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            if (pixelStride <= 0 || rowStride < pixelStride * image.width) null else {
-                val rowPadding = rowStride - pixelStride * image.width
-                val paddedWidth = image.width + rowPadding / pixelStride
-                buffer.rewind()
-                val padded = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
-                padded.copyPixelsFromBuffer(buffer)
-                if (paddedWidth == image.width) padded else Bitmap.createBitmap(padded, 0, 0, image.width, image.height).also { padded.recycle() }
-            }
-        } catch (e: Throwable) { e.printStackTrace(); null }
-    }
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel("translator", "Screen Translator", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
-    private fun notification(text: String): Notification = Notification.Builder(this, "translator")
-        .setContentTitle("Screen Translator")
-        .setContentText(text)
-        .setSmallIcon(android.R.drawable.ic_menu_search)
-        .setOngoing(true)
-        .build()
-
-    override fun onBind(intent: Intent?) = null
 
     override fun onDestroy() {
-        stopped = true
-        handler.removeCallbacksAndMessages(null)
-        try { overlayWindow?.removeView(overlayView) } catch (_: Throwable) {}
-        translators.values.forEach { try { it.close() } catch (_: Throwable) {} }
-        translators.clear()
-        try { latin.close() } catch (_: Throwable) {}
-        try { chinese.close() } catch (_: Throwable) {}
-        try { devanagari.close() } catch (_: Throwable) {}
-        try { japanese.close() } catch (_: Throwable) {}
-        try { korean.close() } catch (_: Throwable) {}
-        try { languageId.close() } catch (_: Throwable) {}
-        try { display?.release() } catch (_: Throwable) {}
-        try { reader?.close() } catch (_: Throwable) {}
-        try { projection?.unregisterCallback(projectionCallback) } catch (_: Throwable) {}
-        try { projection?.stop() } catch (_: Throwable) {}
-        display = null; reader = null; projection = null; overlayView = null
+        stopping = true
+        frames.stop()
+        main.removeCallbacksAndMessages(null)
+        detail?.dismiss()
+        detail = null
+        try { controls?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
+        try { overlay?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
+        overlay?.setSnapshot(null)
+        analyzer.close()
+        capture.close()
+        display?.release()
+        projection?.unregisterCallback(callback)
+        projection?.stop()
+        display = null
+        projection = null
+        controls = null
+        overlay = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        TranslationStatus.update(TranslationStatus.State(message = stopMessage))
         super.onDestroy()
     }
+
+    override fun onBind(intent: Intent?) = null
+    private fun dp(value: Int) = (resources.displayMetrics.density * value + 0.5f).toInt()
 }

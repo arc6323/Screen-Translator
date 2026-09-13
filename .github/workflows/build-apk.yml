@@ -1,15 +1,23 @@
-name: Build Screen Translator APK
+name: Verify and build Screen Translator
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, 'fix/**']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,10 +30,30 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Generate pinned Gradle wrapper
+        run: gradle --no-daemon wrapper --gradle-version 8.10.2 --distribution-type bin
+      - name: Upload generated wrapper
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-wrapper-bootstrap
+          path: |
+            gradlew
+            gradlew.bat
+            gradle/wrapper/
+      - name: Unit tests, Android lint and APK
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ github.run_number }}
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: warn
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: screen-translator-debug-apk
+          name: screen-translator-0.3.0-debug-${{ github.run_number }}
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

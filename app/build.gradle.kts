@@ -8,8 +8,8 @@ android {
         applicationId = "com.arc6323.screentranslator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     compileOptions {
@@ -18,9 +18,11 @@ android {
     }
 
     kotlinOptions { jvmTarget = "17" }
+    buildFeatures { buildConfig = true }
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.mlkit:text-recognition:16.0.1")
