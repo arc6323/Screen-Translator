@@ -3,15 +3,22 @@ package com.arc6323.screentranslator
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.translate.TranslateLanguage
+import com.google.mlkit.translate.TranslateRemoteModel
 
 class MainActivity : Activity() {
     companion object { const val REQUEST_CAPTURE = 4101 }
@@ -19,9 +26,6 @@ class MainActivity : Activity() {
     private var waitingForOverlay = false
     private var captureRequested = false
     private lateinit var statusText: TextView
-    private var progressDialog: AlertDialog? = null
-    private var progressBar: ProgressBar? = null
-    private var progressText: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,13 +83,15 @@ class MainActivity : Activity() {
             val targetCode = LanguageCacheManager.targetLanguage(this)
             val targetName = LanguageCacheManager.targetLanguageName(this)
             val selected = LanguageCacheManager.selected(this)
-            val selectedNames = LanguageCacheManager.languages.filter { it.code in selected }.joinToString(", ") { it.name }
+            val selectedNames = LanguageCacheManager.languages
+                .filter { it.code in selected }
+                .joinToString(", ") { it.name }
             statusText.text = "Кэш: проверяется…\nВыбрано: $selectedNames\nЯзык телефона: $targetName ($targetCode)"
             LanguageCacheManager.isDownloaded("ru") { ru ->
                 LanguageCacheManager.isDownloaded("en") { en ->
                     runOnUiThread {
                         if (isFinishing) return@runOnUiThread
-                        statusText.text = "Кэш: Русский ${if (ru) "✓" else "✗"}, English ${if (en) "✓" else "✗"}\nВыбрано: $selectedNames\nЯзык телефона: $targetName ($targetCode)"
+                        statusText.text = "Кэш: Русский ${if (ru) "✓" else "⏳"}, English ${if (en) "✓" else "✗"}\nВыбрано: $selectedNames\nЯзык телефона: $targetName ($targetCode)"
                     }
                 }
             }
@@ -95,78 +101,221 @@ class MainActivity : Activity() {
     }
 
     private fun showLanguageDialog() {
-        try {
+        val selected = LanguageCacheManager.selected(this).toMutableSet()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 4, 24, 0)
+        }
+        val info = TextView(this).apply {
+            text = "Размер модели: ≈30 МБ\nEnglish встроен в ML Kit и готов сразу.\nГалочка у дополнительного языка = добавить его в загрузку."
+            textSize = 13f
+            setPadding(0, 0, 0, 14)
+        }
+        root.addView(info)
+
+        val progressText = TextView(this).apply {
+            text = ""
+            textSize = 14f
+            setPadding(0, 4, 0, 6)
+        }
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = false
+            progress = 0
+            visibility = View.GONE
+        }
+        root.addView(progressText)
+        root.addView(progress)
+
+        val scroll = ScrollView(this)
+        val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(rows)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        var dialog: AlertDialog? = null
+        var downloadRunning = false
+        var lastRequested = selected.toSet()
+
+        fun rowButton(text: String, onClick: () -> Unit): Button = Button(this).apply {
+            this.text = text
+            textSize = 12f
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(12, 0, 12, 0)
+            setOnClickListener { onClick() }
+        }
+
+        fun renderRows() {
+            rows.removeAllViews()
             val all = LanguageCacheManager.languages
-            val selected = LanguageCacheManager.selected(this).toMutableSet()
-            val checked = all.map { it.code in selected }.toBooleanArray()
-            AlertDialog.Builder(this)
-                .setTitle("Языки для кэширования")
-                .setMultiChoiceItems(all.map { it.name }.toTypedArray(), checked) { _, which, isChecked ->
-                    if (isChecked) selected.add(all[which].code) else selected.remove(all[which].code)
+            all.forEach { language ->
+                val code = language.code
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, 4, 0, 4)
                 }
-                .setNegativeButton("ОТМЕНА", null)
-                .setPositiveButton("СОХРАНИТЬ") { _, _ ->
-                    try {
-                        LanguageCacheManager.saveSelected(this, selected)
-                        showDownloadProgress()
-                        LanguageCacheManager.prepareSelected(this) { state ->
-                            runOnUiThread { updateDownloadProgress(state) }
-                        }
-                    } catch (e: Throwable) {
-                        progressText?.text = "Ошибка запуска: ${e.localizedMessage ?: e.javaClass.simpleName}"
-                        progressBar?.isIndeterminate = false
+                val check = CheckBox(this)
+                val mandatory = code == "ru" || code == "en"
+                check.isChecked = if (code == "en") true else if (mandatory) false else code in selected
+                check.isEnabled = !mandatory
+                if (!mandatory) {
+                    check.setOnCheckedChangeListener { _, checked ->
+                        if (checked) selected.add(code) else selected.remove(code)
                     }
                 }
-                .show()
-        } catch (_: Throwable) {
-            Toast.makeText(this, "Настройки языков временно недоступны", Toast.LENGTH_LONG).show()
-        }
-    }
+                row.addView(check, LinearLayout.LayoutParams(52, -2))
 
-    private fun showDownloadProgress() {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(50, 25, 50, 10)
+                val textBox = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(4, 0, 6, 0)
+                }
+                val name = TextView(this).apply {
+                    text = language.name
+                    textSize = 17f
+                }
+                val state = TextView(this).apply {
+                    text = if (code == "en") "Встроен • готов • 0 МБ загрузки"
+                    else "Проверка… • ≈${LanguageCacheManager.ESTIMATED_MODEL_MB.toInt()} МБ"
+                    textSize = 12f
+                    setTextColor(Color.GRAY)
+                }
+                textBox.addView(name)
+                textBox.addView(state)
+                row.addView(textBox, LinearLayout.LayoutParams(0, -2, 1f))
+
+                val action = rowButton("…") {}
+                row.addView(action, LinearLayout.LayoutParams(100, 48))
+                rows.addView(row)
+
+                if (code == "en") {
+                    action.text = "ГОТОВ"
+                    action.isEnabled = false
+                    return@forEach
+                }
+
+                LanguageCacheManager.isDownloaded(code) { downloaded ->
+                    runOnUiThread {
+                        if (dialog?.isShowing != true) return@runOnUiThread
+                        check.isChecked = if (mandatory) downloaded else code in selected
+                        state.text = if (downloaded) "Скачан ✓ • ≈${LanguageCacheManager.ESTIMATED_MODEL_MB.toInt()} МБ"
+                        else if (downloadRunning && code == LanguageCacheManager.selected(this).firstOrNull()) "Загрузка… • ≈${LanguageCacheManager.ESTIMATED_MODEL_MB.toInt()} МБ"
+                        else "Не скачан • ≈${LanguageCacheManager.ESTIMATED_MODEL_MB.toInt()} МБ"
+                        action.text = if (downloaded) "УДАЛИТЬ" else "СКАЧАТЬ"
+                        action.setOnClickListener {
+                            if (downloaded) {
+                                if (mandatory) {
+                                    Toast.makeText(this, "Русский — обязательная модель", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    val model = TranslateLanguage.fromLanguageTag(code)?.let { TranslateRemoteModel.Builder(it).build() }
+                                    if (model != null) {
+                                        RemoteModelManager.getInstance().deleteDownloadedModel(model)
+                                            .addOnSuccessListener {
+                                                selected.remove(code)
+                                                runOnUiThread {
+                                                    Toast.makeText(this, "${language.name} удалён из кэша", Toast.LENGTH_SHORT).show()
+                                                    renderRows()
+                                                    refreshStatus()
+                                                }
+                                            }
+                                    }
+                                }
+                            } else {
+                                selected.add(code)
+                                startLanguageDownload(setOf(code), progressText, progress, {
+                                    downloadRunning = false
+                                    renderRows()
+                                }) { downloadRunning = true }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        progressText = TextView(this).apply {
-            text = "Подготовка языковых моделей…"
-            textSize = 16f
+
+        renderRows()
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
-        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progress = 0
-            isIndeterminate = true
+        val pause = Button(this).apply {
+            text = "ПАУЗА"
+            setOnClickListener {
+                if (downloadRunning) {
+                    LanguageCacheManager.setPaused(true)
+                    progressText.text = "Пауза после текущей загрузки. Активную загрузку ML Kit нельзя прервать программно."
+                    text = "ПРОДОЛЖИТЬ"
+                } else if (LanguageCacheManager.isPaused()) {
+                    LanguageCacheManager.setPaused(false)
+                    text = "ПАУЗА"
+                    startLanguageDownload(lastRequested, progressText, progress, {
+                        downloadRunning = false
+                        renderRows()
+                    }) { downloadRunning = true }
+                }
+            }
         }
-        content.addView(progressText)
-        content.addView(progressBar)
-        progressDialog = AlertDialog.Builder(this)
-            .setTitle("Загрузка языков")
-            .setView(content)
-            .setNegativeButton("СКРЫТЬ", null)
+        val download = Button(this).apply {
+            text = "СКАЧАТЬ ВЫБРАННЫЕ"
+            setOnClickListener {
+                lastRequested = selected.toSet()
+                startLanguageDownload(lastRequested, progressText, progress, {
+                    downloadRunning = false
+                    renderRows()
+                }) { downloadRunning = true }
+            }
+        }
+        footer.addView(pause, LinearLayout.LayoutParams(0, 52, 1f))
+        footer.addView(download, LinearLayout.LayoutParams(0, 52, 1.7f))
+        root.addView(footer)
+
+        dialog = AlertDialog.Builder(this)
+            .setTitle("Языки для кэширования")
+            .setView(root)
+            .setNegativeButton("ЗАКРЫТЬ", null)
             .create()
-        progressDialog?.show()
+        dialog.show()
     }
 
-    private fun updateDownloadProgress(state: LanguageCacheManager.DownloadState) {
-        if (isFinishing) return
-        val total = state.total
-        val done = state.done.coerceIn(0, total.coerceAtLeast(1))
-        progressBar?.isIndeterminate = false
-        progressBar?.max = total.coerceAtLeast(1)
-        progressBar?.progress = done
-        val current = state.currentName ?: "Подготовка"
-        val percent = if (total > 0) done * 100 / total else 100
-        val speed = LanguageCacheManager.estimatedSpeedMbPerSec(state.elapsedMs)
-        val speedText = if (speed != null) "\nОценка: %.1f МБ/с".format(speed) else ""
-        val error = state.errorMessage?.let { "\nОшибка: $it" } ?: ""
-        progressText?.text = when {
-            state.failed > 0 && state.done >= total -> "Готово: ${state.done}/$total\nОшибок: ${state.failed}$error"
-            state.done >= total && total > 0 -> "Готово: $total/$total"
-            else -> "Загрузка: $current\n$percent% ($done/$total)$speedText$error"
-        }
-        refreshStatus()
-        if (total > 0 && state.done >= total) {
-            progressDialog?.window?.decorView?.postDelayed({ progressDialog?.dismiss() }, 1800)
+    private fun startLanguageDownload(
+        requested: Set<String>,
+        progressText: TextView,
+        progress: ProgressBar,
+        onFinished: () -> Unit,
+        onStarted: () -> Unit
+    ) {
+        onStarted()
+        progress.visibility = View.VISIBLE
+        progress.isIndeterminate = true
+        progressText.text = "Подготовка…\nПроцент появится только после завершения модели — ML Kit не отдаёт Android байтовый прогресс."
+        LanguageCacheManager.prepareCodes(this, requested) { state ->
+            runOnUiThread {
+                val total = state.total.coerceAtLeast(1)
+                val done = state.done.coerceIn(0, total)
+                if (state.downloading) {
+                    progress.isIndeterminate = true
+                    progressText.text = "Загрузка: ${state.currentName}\n≈${LanguageCacheManager.ESTIMATED_MODEL_MB.toInt()} МБ • система показывает реальный прогресс в уведомлении"
+                } else if (state.paused) {
+                    progress.isIndeterminate = false
+                    progress.progress = done * 100 / total
+                    progressText.text = "Пауза: готово $done/$total"
+                } else {
+                    progress.isIndeterminate = false
+                    progress.max = 100
+                    progress.progress = done * 100 / total
+                    val speed = LanguageCacheManager.estimatedSpeedMbPerSec(state.elapsedMs)
+                    val speedText = if (speed != null) " • оценка ${"%.1f".format(speed)} МБ/с" else ""
+                    val error = state.errorMessage?.let { "\nОшибка: $it" } ?: ""
+                    progressText.text = if (state.done >= state.total && state.total > 0) {
+                        "Готово: ${state.done}/${state.total}$speedText$error"
+                    } else {
+                        "Готово: ${state.done}/${state.total}$error"
+                    }
+                }
+                refreshStatus()
+                if (!state.downloading && !state.paused && state.done >= state.total) onFinished()
+            }
         }
     }
 
