@@ -32,8 +32,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        refreshStatus()
-        prepareDefaultCache()
+        safeRefreshStatus()
+        // Let the first frame render before ML Kit starts model management. This keeps
+        // the main screen usable even if Google Play services/model storage is busy.
+        window.decorView.postDelayed({ prepareDefaultCacheSafely() }, 600)
     }
 
     private fun buildUi() {
@@ -74,10 +76,20 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        refreshStatus()
+        safeRefreshStatus()
         if (waitingForOverlay && Settings.canDrawOverlays(this)) {
             waitingForOverlay = false
             requestScreenCapture()
+        }
+    }
+
+    private fun safeRefreshStatus() {
+        try {
+            refreshStatus()
+        } catch (t: Throwable) {
+            cacheStatus.text = "Кэш: проверка недоступна\nЯзык телефона: ${java.util.Locale.getDefault().language}"
+            batteryStatus.text = "Батарея: состояние недоступно"
+            t.printStackTrace()
         }
     }
 
@@ -103,16 +115,26 @@ class MainActivity : Activity() {
         batteryStatus.text = if (batteryFree) "Батарея: без ограничений" else "Батарея: оптимизация включена"
     }
 
-    private fun prepareDefaultCache() {
-        // Fresh installations always have Russian + English selected. English is
-        // built into ML Kit; Russian is the only default remote model to download.
-        LanguageCacheManager.isDownloaded("ru") { ready ->
-            if (!ready) {
-                runOnUiThread { showDownloadProgress() }
+    private fun prepareDefaultCacheSafely() {
+        if (isFinishing || isDestroyed) return
+        try {
+            // Fresh installations always have Russian + English selected. English is
+            // built into ML Kit; Russian is the only default remote model to download.
+            LanguageCacheManager.isDownloaded("ru") { ready ->
+                if (!ready) runOnUiThread {
+                    if (!isFinishing && !isDestroyed) showDownloadProgress()
+                }
             }
-        }
-        LanguageCacheManager.prepareSelected(this) { state ->
-            runOnUiThread { updateDownloadProgress(state) }
+            LanguageCacheManager.prepareSelected(this) { state ->
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) updateDownloadProgress(state)
+                }
+            }
+        } catch (t: Throwable) {
+            t.printStackTrace()
+            runOnUiThread {
+                cacheStatus.text = "Кэш: русский будет загружен при следующей попытке\nЯзык телефона: ${LanguageCacheManager.targetLanguageName(this)}"
+            }
         }
     }
 
@@ -129,10 +151,16 @@ class MainActivity : Activity() {
             .setNegativeButton("ОТМЕНА", null)
             .setPositiveButton("СОХРАНИТЬ") { _, _ ->
                 LanguageCacheManager.saveSelected(this, selected)
-                refreshStatus()
+                safeRefreshStatus()
                 showDownloadProgress()
-                LanguageCacheManager.prepareSelected(this) { state ->
-                    runOnUiThread { updateDownloadProgress(state) }
+                try {
+                    LanguageCacheManager.prepareSelected(this) { state ->
+                        runOnUiThread { if (!isFinishing && !isDestroyed) updateDownloadProgress(state) }
+                    }
+                } catch (t: Throwable) {
+                    t.printStackTrace()
+                    downloadText?.text = "Не удалось начать загрузку. Проверьте интернет и Google Play services."
+                    downloadProgress?.isIndeterminate = false
                 }
             }
             .show()
@@ -167,9 +195,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateDownloadProgress(state: LanguageCacheManager.DownloadState) {
-        if (downloadDialog?.isShowing != true && state.done < state.total) {
-            showDownloadProgress()
-        }
+        if (downloadDialog?.isShowing != true && state.done < state.total) showDownloadProgress()
 
         downloadProgress?.max = state.total.coerceAtLeast(1)
         downloadProgress?.progress = state.done.coerceAtMost(state.total)
@@ -179,11 +205,9 @@ class MainActivity : Activity() {
             progressTicker.removeCallbacksAndMessages(null)
             val result = if (state.failed == 0) {
                 if (state.total == 0) "Готово: English встроен в ML Kit" else "Готово: все выбранные модели доступны"
-            } else {
-                "Завершено с ошибками: ${state.failed}"
-            }
+            } else "Завершено с ошибками: ${state.failed}"
             downloadText?.text = result
-            refreshStatus()
+            safeRefreshStatus()
             if (downloadDialog?.isShowing == true) {
                 downloadDialog?.window?.decorView?.postDelayed({ downloadDialog?.dismiss() }, 1400)
             }
