@@ -31,11 +31,10 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // IMPORTANT: keep startup completely independent from ML Kit/Google Play services.
+        // Model-manager calls are deferred until the user explicitly opens language settings.
         buildUi()
-        safeRefreshStatus()
-        // Let the first frame render before ML Kit starts model management. This keeps
-        // the main screen usable even if Google Play services/model storage is busy.
-        window.decorView.postDelayed({ prepareDefaultCacheSafely() }, 600)
+        showBasicStatus()
     }
 
     private fun buildUi() {
@@ -74,96 +73,97 @@ class MainActivity : Activity() {
         battery.setOnClickListener { requestBackgroundOperation() }
     }
 
+    private fun showBasicStatus() {
+        val target = try {
+            val locale = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                getSystemService(android.app.LocaleManager::class.java)?.systemLocales?.get(0)
+            } else if (android.os.Build.VERSION.SDK_INT >= 24) {
+                android.os.LocaleList.getDefault().get(0)
+            } else {
+                @Suppress("DEPRECATION") java.util.Locale.getDefault()
+            }
+            locale?.language ?: java.util.Locale.getDefault().language
+        } catch (_: Throwable) {
+            java.util.Locale.getDefault().language
+        }
+        cacheStatus.text = "Кэш: проверка при открытии языков\nЯзык телефона: $target"
+        updateBatteryStatus()
+    }
+
     override fun onResume() {
         super.onResume()
-        safeRefreshStatus()
+        updateBatteryStatus()
         if (waitingForOverlay && Settings.canDrawOverlays(this)) {
             waitingForOverlay = false
             requestScreenCapture()
         }
     }
 
-    private fun safeRefreshStatus() {
+    private fun updateBatteryStatus() {
         try {
-            refreshStatus()
-        } catch (t: Throwable) {
-            cacheStatus.text = "Кэш: проверка недоступна\nЯзык телефона: ${java.util.Locale.getDefault().language}"
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val batteryFree = android.os.Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(packageName)
+            batteryStatus.text = if (batteryFree) "Батарея: без ограничений" else "Батарея: оптимизация включена"
+        } catch (_: Throwable) {
             batteryStatus.text = "Батарея: состояние недоступно"
-            t.printStackTrace()
         }
     }
 
     private fun refreshStatus() {
-        val selected = LanguageCacheManager.selected(this)
-        val selectedNames = LanguageCacheManager.languages
-            .filter { it.code in selected && it.code != "en" }
-            .joinToString(", ") { it.name }
-
-        val target = LanguageCacheManager.targetLanguageName(this)
-        val targetCode = LanguageCacheManager.targetLanguage(this)
-        LanguageCacheManager.isDownloaded("ru") { ruReady ->
-            runOnUiThread {
-                if (isFinishing) return@runOnUiThread
-                val russian = if (ruReady) "Русский ✓" else "Русский ⏳"
-                val extra = selectedNames.ifBlank { "нет" }
-                cacheStatus.text = "Кэш: $russian, English встроен\nВыбрано для загрузки: $extra\nЯзык телефона: $target ($targetCode)"
-            }
-        }
-
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        val batteryFree = android.os.Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(packageName)
-        batteryStatus.text = if (batteryFree) "Батарея: без ограничений" else "Батарея: оптимизация включена"
-    }
-
-    private fun prepareDefaultCacheSafely() {
-        if (isFinishing || isDestroyed) return
         try {
-            // Fresh installations always have Russian + English selected. English is
-            // built into ML Kit; Russian is the only default remote model to download.
-            LanguageCacheManager.isDownloaded("ru") { ready ->
-                if (!ready) runOnUiThread {
-                    if (!isFinishing && !isDestroyed) showDownloadProgress()
-                }
-            }
-            LanguageCacheManager.prepareSelected(this) { state ->
+            val selected = LanguageCacheManager.selected(this)
+            val selectedNames = LanguageCacheManager.languages
+                .filter { it.code in selected && it.code != "en" }
+                .joinToString(", ") { it.name }
+            val target = LanguageCacheManager.targetLanguageName(this)
+            val targetCode = LanguageCacheManager.targetLanguage(this)
+            LanguageCacheManager.isDownloaded("ru") { ruReady ->
                 runOnUiThread {
-                    if (!isFinishing && !isDestroyed) updateDownloadProgress(state)
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    val russian = if (ruReady) "Русский ✓" else "Русский ⏳"
+                    val extra = selectedNames.ifBlank { "нет" }
+                    cacheStatus.text = "Кэш: $russian, English встроен\nВыбрано для загрузки: $extra\nЯзык телефона: $target ($targetCode)"
                 }
             }
+            updateBatteryStatus()
         } catch (t: Throwable) {
             t.printStackTrace()
-            runOnUiThread {
-                cacheStatus.text = "Кэш: русский будет загружен при следующей попытке\nЯзык телефона: ${LanguageCacheManager.targetLanguageName(this)}"
-            }
+            showBasicStatus()
         }
     }
 
     private fun showLanguageDialog() {
-        val all = LanguageCacheManager.languages
-        val selected = LanguageCacheManager.selected(this).toMutableSet()
-        val checked = all.map { it.code in selected }.toBooleanArray()
+        // First ML Kit access is deliberately here, not during Activity startup.
+        try {
+            val all = LanguageCacheManager.languages
+            val selected = LanguageCacheManager.selected(this).toMutableSet()
+            val checked = all.map { it.code in selected }.toBooleanArray()
 
-        AlertDialog.Builder(this)
-            .setTitle("Языки для кэширования")
-            .setMultiChoiceItems(all.map { it.name }.toTypedArray(), checked) { _, which, isChecked ->
-                if (isChecked) selected.add(all[which].code) else selected.remove(all[which].code)
-            }
-            .setNegativeButton("ОТМЕНА", null)
-            .setPositiveButton("СОХРАНИТЬ") { _, _ ->
-                LanguageCacheManager.saveSelected(this, selected)
-                safeRefreshStatus()
-                showDownloadProgress()
-                try {
-                    LanguageCacheManager.prepareSelected(this) { state ->
-                        runOnUiThread { if (!isFinishing && !isDestroyed) updateDownloadProgress(state) }
-                    }
-                } catch (t: Throwable) {
-                    t.printStackTrace()
-                    downloadText?.text = "Не удалось начать загрузку. Проверьте интернет и Google Play services."
-                    downloadProgress?.isIndeterminate = false
+            AlertDialog.Builder(this)
+                .setTitle("Языки для кэширования")
+                .setMultiChoiceItems(all.map { it.name }.toTypedArray(), checked) { _, which, isChecked ->
+                    if (isChecked) selected.add(all[which].code) else selected.remove(all[which].code)
                 }
-            }
-            .show()
+                .setNegativeButton("ОТМЕНА", null)
+                .setPositiveButton("СОХРАНИТЬ") { _, _ ->
+                    LanguageCacheManager.saveSelected(this, selected)
+                    refreshStatus()
+                    showDownloadProgress()
+                    try {
+                        LanguageCacheManager.prepareSelected(this) { state ->
+                            runOnUiThread { if (!isFinishing && !isDestroyed) updateDownloadProgress(state) }
+                        }
+                    } catch (t: Throwable) {
+                        t.printStackTrace()
+                        downloadText?.text = "Не удалось начать загрузку. Проверьте интернет и Google Play services."
+                        downloadProgress?.isIndeterminate = false
+                    }
+                }
+                .show()
+        } catch (t: Throwable) {
+            t.printStackTrace()
+            Toast.makeText(this, "Не удалось открыть языки. Проверьте Google Play services.", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun showDownloadProgress() {
@@ -207,7 +207,7 @@ class MainActivity : Activity() {
                 if (state.total == 0) "Готово: English встроен в ML Kit" else "Готово: все выбранные модели доступны"
             } else "Завершено с ошибками: ${state.failed}"
             downloadText?.text = result
-            safeRefreshStatus()
+            refreshStatus()
             if (downloadDialog?.isShowing == true) {
                 downloadDialog?.window?.decorView?.postDelayed({ downloadDialog?.dismiss() }, 1400)
             }
