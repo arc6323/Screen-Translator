@@ -46,6 +46,7 @@ class TranslatorService : Service() {
     private var detail: AlertDialog? = null
     private var frozen = false
     private var freezeRequested = false
+    private var captureVisible = true
     private var stopping = false
     private var stopMessage = "Перевод выключен"
     private var lastNotification = ""
@@ -65,10 +66,15 @@ class TranslatorService : Service() {
             main.postDelayed(resizeTask, 120)
         }
         override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+            captureVisible = isVisible
             if (!isVisible && !frozen) {
                 frames.invalidate()
                 overlay?.setItems(emptyList())
                 translatedItems = emptyList()
+                capture.stopMonitoring()
+                restoreWindows()
+            } else if (isVisible && !frozen) {
+                schedule(100)
             }
         }
     }
@@ -198,7 +204,7 @@ class TranslatorService : Service() {
     } else 0.8f
 
     private fun scan() {
-        if (stopping || frozen || projection == null) return
+        if (stopping || frozen || !captureVisible || projection == null) return
         if (analyzer.isBusy) { schedule(120); return }
         val token = frames.begin() ?: return
         val snapshotRequested = freezeRequested

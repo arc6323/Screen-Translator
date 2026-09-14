@@ -30,16 +30,6 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Generate pinned Gradle wrapper
-        run: gradle --no-daemon wrapper --gradle-version 8.10.2 --distribution-type bin
-      - name: Upload generated wrapper
-        uses: actions/upload-artifact@v4
-        with:
-          name: gradle-wrapper-bootstrap
-          path: |
-            gradlew
-            gradlew.bat
-            gradle/wrapper/
       - name: Unit tests, Android lint and APK
         run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
       - name: Upload validation reports

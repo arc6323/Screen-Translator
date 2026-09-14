@@ -296,9 +296,10 @@ class MainActivity : Activity() {
     private fun beginStart() {
         val missing = requiredModels() - LanguageCacheManager.downloaded
         if (missing.isNotEmpty()) {
-            startAfterDownload = true
             languagesPanel.visibility = View.VISIBLE
             LanguageCacheManager.download(this, requiredModels())
+            startAfterDownload = true
+            renderState()
         } else requestOverlayAndCapture()
     }
 

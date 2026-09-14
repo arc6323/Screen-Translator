@@ -24,6 +24,7 @@ class ModelDownloadQueue(
     private var current: String? = null
     private var paused = false
     private var operation = 0L
+    private var lastPublished: Snapshot? = null
     fun snapshot() = Snapshot(
         requested.toSet(), pending.toList(), current, ready.toSet(), errors.toMap(), paused
     )
@@ -80,5 +81,11 @@ class ModelDownloadQueue(
             }
         }
     }
-    private fun publish() = changed(snapshot())
+    private fun publish() {
+        val next = snapshot()
+        if (next != lastPublished) {
+            lastPublished = next
+            changed(next)
+        }
+    }
 }
