@@ -3,6 +3,7 @@ package com.arc6323.screentranslator
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -45,6 +46,8 @@ class MainActivity : Activity() {
     private var captureRequested = false
     private var startAfterDownload = false
     private var resumed = false
+    private var resumeRequested = false
+    private var notificationSettingsPending = false
     private var search = ""
     private val observer: () -> Unit = { renderState() }
 
@@ -54,6 +57,8 @@ class MainActivity : Activity() {
         waitingForOverlay = savedInstanceState?.getBoolean("overlay") ?: false
         captureRequested = savedInstanceState?.getBoolean("capture") ?: false
         startAfterDownload = savedInstanceState?.getBoolean("download_start") ?: false
+        resumeRequested = savedInstanceState?.getBoolean("resume_requested") ?: (intent.action == TranslatorService.ACTION_RESUME_CAPTURE)
+        notificationSettingsPending = savedInstanceState?.getBoolean("notification_settings") ?: false
         val scroll = ScrollView(this).apply { isFillViewport = true }
         val root = column(20).apply { setBackgroundColor(Color.rgb(247, 248, 252)) }
         scroll.addView(root)
@@ -64,11 +69,11 @@ class MainActivity : Activity() {
         cacheStatus = label("", 14)
         root.addView(cacheStatus)
         root.addView(label(
-            "Live — перевод поверх приложения с доступными нажатиями.\n" +
-                "Снимок — остановленный экран: исходный текст полностью закрыт. Переключатель появится сверху.",
+            "Перевод поверх приложения. Пауза, продолжение и выключение — в уведомлении.\n" +
+                "Текст на языке результата пропускается. Неуверенно распознанные строки остаются без изменений.",
             14
         ))
-        start = button("ВКЛЮЧИТЬ LIVE") { beginStart() }
+        start = button("ВКЛЮЧИТЬ ПЕРЕВОД") { beginStart() }
         root.addView(start)
         stop = button("ОСТАНОВИТЬ") {
             startAfterDownload = false
@@ -176,12 +181,28 @@ class MainActivity : Activity() {
         super.onResume()
         resumed = true
         LanguageCacheManager.refresh()
+        if (notificationSettingsPending) {
+            notificationSettingsPending = false
+            if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) resumeRequested = true
+        }
+        if (resumeRequested) {
+            resumeRequested = false
+            if (!TranslationStatus.state.running) beginStart()
+        }
         if (waitingForOverlay) {
             waitingForOverlay = false
             if (Settings.canDrawOverlays(this)) requestCapture()
             else showMessage("Разрешите отображение поверх других приложений, чтобы включить перевод.")
         }
         renderState()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == TranslatorService.ACTION_RESUME_CAPTURE && !TranslationStatus.state.running) {
+            if (resumed) beginStart() else resumeRequested = true
+        }
     }
 
     override fun onPause() { resumed = false; super.onPause() }
@@ -193,6 +214,8 @@ class MainActivity : Activity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("resume_requested", resumeRequested)
+        outState.putBoolean("notification_settings", notificationSettingsPending)
         outState.putBoolean("overlay", waitingForOverlay)
         outState.putBoolean("capture", captureRequested)
         outState.putBoolean("download_start", startAfterDownload)
@@ -220,7 +243,7 @@ class MainActivity : Activity() {
         target.text = "ПЕРЕВОДИТЬ НА: ${manager.targetLanguageName(this)}"
         target.isEnabled = !running && !q.active && !startAfterDownload
         start.isEnabled = !running && !captureRequested && !startAfterDownload && !manager.checking
-        start.text = if (missing.isEmpty()) "ВКЛЮЧИТЬ LIVE" else "СКАЧАТЬ МОДЕЛИ И ВКЛЮЧИТЬ"
+        start.text = if (missing.isEmpty()) "ВКЛЮЧИТЬ ПЕРЕВОД" else "СКАЧАТЬ МОДЕЛИ И ВКЛЮЧИТЬ"
         stop.isEnabled = running || startAfterDownload
         stop.text = if (running) "ОСТАНОВИТЬ" else "ОТМЕНИТЬ ЗАПУСК"
         download.isEnabled = !running && !q.active
@@ -314,11 +337,21 @@ class MainActivity : Activity() {
 
     private fun requestOverlayAndCapture() {
         if (captureRequested || TranslationStatus.state.running || isFinishing) return
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
-            !getPreferences(MODE_PRIVATE).getBoolean("notifications_asked", false)) {
-            getPreferences(MODE_PRIVATE).edit().putBoolean("notifications_asked", true).apply()
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+        if (!getSystemService(NotificationManager::class.java).areNotificationsEnabled()) {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                !getPreferences(MODE_PRIVATE).getBoolean("notifications_asked", false)) {
+                getPreferences(MODE_PRIVATE).edit().putBoolean("notifications_asked", true).apply()
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+            } else {
+                AlertDialog.Builder(this).setTitle("Включите уведомления")
+                    .setMessage("Управление переводом находится в уведомлении: пауза, продолжение и выключение.")
+                    .setNegativeButton("Отмена", null)
+                    .setPositiveButton("Открыть настройки") { _, _ ->
+                        notificationSettingsPending = true
+                        startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+                    }.show()
+            }
             return
         }
         try {
@@ -372,7 +405,10 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, permissions, results)
-        if (code == REQUEST_NOTIFICATIONS) requestOverlayAndCapture()
+        if (code == REQUEST_NOTIFICATIONS) {
+            if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) requestOverlayAndCapture()
+            else showMessage("Для управления переводом включите уведомления приложения.")
+        }
     }
 
     private fun showMessage(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()

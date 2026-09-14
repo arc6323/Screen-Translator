@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,6 +32,35 @@ jobs:
           gradle-version: '8.10.2'
       - name: Unit tests, Android lint and APK
         run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - name: Enable KVM for Android regression checks
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Check Cyrillic guard on Android 14
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
+      - name: Summarize verification
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          for group in ("test-results/testDebugUnitTest", "outputs/androidTest-results/connected"):
+              files = list(pathlib.Path("app/build", group).rglob("TEST-*.xml"))
+              suites = [ET.parse(p).getroot() for p in files]
+              totals = {key: sum(int(s.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
+              print(group, totals, flush=True)
+          p = pathlib.Path("app/build/reports/lint-results-debug.xml")
+          if p.exists():
+              issues = ET.parse(p).getroot().findall("issue")
+              print("lint errors:", sum(i.get("severity") in ("Error", "Fatal") for i in issues), flush=True)
+          PY
       - name: Upload validation reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -40,10 +69,11 @@ jobs:
           path: |
             app/build/reports/
             app/build/test-results/
+            app/build/outputs/androidTest-results/
           if-no-files-found: warn
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: screen-translator-0.3.0-debug-${{ github.run_number }}
+          name: screen-translator-0.4.0-debug-${{ github.run_number }}
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

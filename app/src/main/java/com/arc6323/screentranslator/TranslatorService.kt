@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
-import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.graphics.Point
 import android.graphics.Rect
@@ -19,8 +18,8 @@ import android.os.*
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
-import android.widget.*
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -28,9 +27,11 @@ class TranslatorService : Service() {
     companion object {
         const val ACTION_START = "com.arc6323.screentranslator.START"
         const val ACTION_STOP = "com.arc6323.screentranslator.STOP"
-        const val ACTION_TOGGLE = "com.arc6323.screentranslator.TOGGLE"
+        const val ACTION_PAUSE = "com.arc6323.screentranslator.PAUSE"
+        const val ACTION_RESUME_CAPTURE = "com.arc6323.screentranslator.RESUME_CAPTURE"
         private const val CHANNEL = "translator"
         private const val NOTIFICATION_ID = 7
+        private const val RECOVERY_ID = 8
     }
     private val main = Handler(Looper.getMainLooper())
     private val frames = FrameGuard()
@@ -40,41 +41,43 @@ class TranslatorService : Service() {
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
     private var overlay: OverlayView? = null
-    private var overlayParams: WindowManager.LayoutParams? = null
-    private var controls: LinearLayout? = null
-    private var modeButton: Button? = null
-    private var detail: AlertDialog? = null
-    private var frozen = false
-    private var freezeRequested = false
+    private var paused = false
     private var captureVisible = true
     private var stopping = false
+    private var interrupted = false
     private var stopMessage = "Перевод выключен"
     private var lastNotification = ""
     private var screenWidth = 1
     private var screenHeight = 1
     private var captureWidth = 1
     private var captureHeight = 1
+    private var topInset = 0
+    private var bottomInset = 0
     private var translatedItems = emptyList<OverlayView.Item>()
+    private var activeToken: Long? = null
+    private var timeout: Runnable? = null
     private val scanTask = Runnable { scan() }
     private val resizeTask = Runnable { resizeCapture() }
     private val callback = object : MediaProjection.Callback() {
         override fun onStop() {
-            if (!stopping) stopWithMessage("Захват экрана остановлен. Включите перевод снова.")
+            if (!stopping) {
+                interrupted = true
+                stopWithMessage("Android завершил захват. Для продолжения нужно разрешить его снова.")
+            }
         }
         override fun onCapturedContentResize(width: Int, height: Int) {
             main.removeCallbacks(resizeTask)
-            main.postDelayed(resizeTask, 120)
+            main.postDelayed(resizeTask, 80)
         }
         override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
             captureVisible = isVisible
-            if (!isVisible && !frozen) {
-                frames.invalidate()
-                overlay?.setItems(emptyList())
-                translatedItems = emptyList()
-                capture.stopMonitoring()
-                restoreWindows()
-            } else if (isVisible && !frozen) {
-                schedule(100)
+            if (!isVisible) {
+                invalidateFrame()
+                clearOverlay()
+                setStatus("Захват временно не виден")
+            } else if (!paused) {
+                setStatus("Перевод включён")
+                schedule(0)
             }
         }
     }
@@ -84,17 +87,16 @@ class TranslatorService : Service() {
         window = getSystemService(WINDOW_SERVICE) as WindowManager
         LanguageCacheManager.initialize(this)
         capture = CaptureEngine(main, ::onSceneChanged)
-        analyzer = FrameAnalyzer()
+        analyzer = FrameAnalyzer(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL, "Перевод экрана", NotificationManager.IMPORTANCE_LOW)
-        )
+            NotificationChannel(CHANNEL, "Перевод экрана", NotificationManager.IMPORTANCE_LOW))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { stopWithMessage("Перевод выключен"); return START_NOT_STICKY }
-            ACTION_TOGGLE -> {
-                if (projection != null) toggleMode() else stopSelf()
+            ACTION_PAUSE -> {
+                if (projection != null) togglePause() else stopSelf()
                 return START_NOT_STICKY
             }
         }
@@ -111,10 +113,11 @@ class TranslatorService : Service() {
                 stopWithMessage("Разрешите отображение поверх приложений.")
                 return START_NOT_STICKY
             }
+            getSystemService(NotificationManager::class.java).cancel(RECOVERY_ID)
             if (Build.VERSION.SDK_INT >= 29) startForeground(
                 NOTIFICATION_ID, notification("Подготовка перевода…"),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            ) else startForeground(NOTIFICATION_ID, notification("Подготовка перевода…"))
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            else startForeground(NOTIFICATION_ID, notification("Подготовка перевода…"))
             projection = (getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager)
                 .getMediaProjection(Activity.RESULT_OK, data)
             projection?.registerCallback(callback, main)
@@ -124,10 +127,10 @@ class TranslatorService : Service() {
                 "ScreenTranslator", captureWidth, captureHeight, resources.displayMetrics.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, main
             ) ?: error("Capture display unavailable")
-            createWindows()
+            createOverlay()
             frames.start()
-            setStatus("Live-перевод включён")
-            schedule(200)
+            setStatus("Перевод включён")
+            schedule(0)
         } catch (_: Exception) {
             stopWithMessage("Не удалось запустить захват. Откройте приложение и попробуйте снова.")
         }
@@ -148,285 +151,242 @@ class TranslatorService : Service() {
         captureHeight = (screenHeight * scale).roundToInt().coerceAtLeast(1)
     }
 
-    private fun createWindows() {
+    private fun createOverlay() {
         val view = OverlayView(this).apply {
             setCaptureSize(captureWidth, captureHeight, screenWidth, screenHeight)
-            setOnClickListener { if (frozen) showFullText() }
+            isClickable = false
+            isLongClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
+        // Exactly one window, permanently non-touchable. It is also below the keyboard.
         val params = WindowManager.LayoutParams(
             -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            alpha = liveAlpha()
-            if (Build.VERSION.SDK_INT >= 28) {
+            alpha = LoopTiming.touchAlpha(if (Build.VERSION.SDK_INT >= 31)
+                getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch else 0.8f)
+            if (Build.VERSION.SDK_INT >= 28)
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
             if (Build.VERSION.SDK_INT >= 30) setFitInsetsTypes(0)
         }
-        overlay = view
-        overlayParams = params
-        window.addView(view, params)
-        controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xEE202536.toInt())
-            modeButton = Button(this@TranslatorService).apply {
-                text = "Снимок"
-                isAllCaps = false
-                minHeight = dp(48)
-                setOnClickListener { toggleMode() }
+        view.setOnApplyWindowInsetsListener { _, insets ->
+            val oldTop = topInset
+            val oldBottom = bottomInset
+            if (Build.VERSION.SDK_INT >= 30) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                topInset = bars.top
+                bottomInset = maxOf(bars.bottom, insets.getInsets(WindowInsets.Type.ime()).bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                topInset = insets.systemWindowInsetTop
+                @Suppress("DEPRECATION")
+                bottomInset = insets.systemWindowInsetBottom
             }
-            addView(modeButton)
-            addView(Button(this@TranslatorService).apply {
-                text = "×"
-                contentDescription = "Остановить перевод"
-                minWidth = dp(48)
-                minHeight = dp(48)
-                setOnClickListener { stopWithMessage("Перевод выключен") }
-            })
+            if (oldTop != topInset || oldBottom != bottomInset) {
+                invalidateFrame()
+                clearOverlay()
+                schedule(40)
+            }
+            insets
         }
-        window.addView(controls, WindowManager.LayoutParams(
-            -2, -2, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(8)
-            y = dp(8)
-        })
-        controls?.post { updateMasks() }
+        overlay = view
+        window.addView(view, params)
+        view.requestApplyInsets()
     }
 
-    private fun liveAlpha(): Float = if (Build.VERSION.SDK_INT >= 31) {
-        min(0.8f, getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch)
-    } else 0.8f
+    private fun contentBounds() = Rect(
+        0, (topInset.toLong() * captureHeight / screenHeight).toInt().coerceIn(0, captureHeight - 1),
+        captureWidth, (captureHeight - bottomInset.toLong() * captureHeight / screenHeight).toInt()
+            .coerceIn(1, captureHeight)
+    )
 
     private fun scan() {
-        if (stopping || frozen || !captureVisible || projection == null) return
-        if (analyzer.isBusy) { schedule(120); return }
+        if (stopping || paused || !captureVisible || projection == null) return
+        if (analyzer.isBusy) { schedule(40); return }
         val token = frames.begin() ?: return
-        val snapshotRequested = freezeRequested
-        val timeout = Runnable {
+        activeToken = token
+        val started = SystemClock.elapsedRealtime()
+        val watchdog = Runnable {
             if (frames.finish(token)) {
+                activeToken = null
                 capture.cancel(token)
-                restoreWindows()
-                setStatus("Обработка заняла слишком много времени. Повторяем…")
-                if (!frozen) schedule(300)
+                restoreOverlay()
+                setStatus("Обработка задержалась. Повторяем…")
+                schedule(80)
             }
         }
-        main.postDelayed(timeout, 5000)
-        capture.request(token, prepared = {
+        timeout = watchdog
+        main.postDelayed(watchdog, 1800)
+        capture.request(token, requireFresh = overlay?.visibility == View.VISIBLE && translatedItems.isNotEmpty(), prepared = {
             if (frames.accepts(token)) {
                 overlay?.visibility = View.INVISIBLE
-                controls?.visibility = View.INVISIBLE
                 overlay?.postOnAnimation {
-                    overlay?.postOnAnimation {
-                        if (frames.accepts(token)) capture.arm(token)
-                    }
+                    overlay?.postOnAnimation { if (frames.accepts(token)) capture.arm(token) }
                 }
             } else capture.cancel(token)
         }, result = { bitmap ->
-            if (!frames.accepts(token)) {
-                bitmap.recycle()
-                return@request
-            }
-            if (snapshotRequested) {
-                frozen = true
-                freezeRequested = false
-                translatedItems = emptyList()
-                overlay?.setItems(emptyList())
-                overlay?.setSnapshot(bitmap.copy(Bitmap.Config.ARGB_8888, false))
-                capture.stopMonitoring()
-                applyMode()
-            }
-            restoreWindows()
-            val selected = LanguageCacheManager.selected(this)
-            val target = LanguageCacheManager.targetLanguage(this)
-            analyzer.analyze(bitmap, selected, target, current = { frames.accepts(token) }) { result ->
+            if (!frames.accepts(token)) { bitmap.recycle(); return@request }
+            main.removeCallbacks(watchdog)
+            main.postDelayed(watchdog, 15000)
+            restoreOverlay()
+            analyzer.analyze(
+                bitmap, LanguageCacheManager.selected(this), LanguageCacheManager.targetLanguage(this),
+                contentBounds(), current = { frames.accepts(token) },
+                partial = { items ->
+                    if (frames.accepts(token)) showItems(items)
+                }
+            ) { result ->
                 if (frames.finish(token)) {
-                    main.removeCallbacks(timeout)
-                    translatedItems = result.items
-                    overlay?.setItems(result.items)
-                    updateMasks()
-                    val message = result.error ?: if (frozen) {
-                        "Снимок готов • нажмите на экран, чтобы прочитать весь перевод"
-                    } else if (result.items.isEmpty()) "Ищем текст для перевода…" else "Live-перевод включён"
+                    activeToken = null
+                    main.removeCallbacks(watchdog)
+                    timeout = null
+                    showItems(result.items)
+                    val message = result.error ?: if (result.items.isEmpty())
+                        "Ждём текст выбранного исходного языка" else "Перевод включён"
                     setStatus(message, result.elapsedMs)
-                    if (!frozen) schedule(if (freezeRequested) 0 else if (result.unchanged) 650 else 180)
+                    schedule(LoopTiming.nextDelay(SystemClock.elapsedRealtime() - started, result.unchanged))
                 }
             }
         })
     }
 
-    private fun toggleMode() {
-        if (stopping) return
-        if (frozen) {
-            detail?.dismiss()
-            detail = null
-            frozen = false
-            freezeRequested = false
-            frames.invalidate()
-            translatedItems = emptyList()
-            overlay?.setItems(emptyList())
-            overlay?.setSnapshot(null)
-            applyMode()
-            setStatus("Live-перевод включён")
-            schedule(0)
-        } else {
-            freezeRequested = true
-            modeButton?.text = "Снимаем…"
-            setStatus("Готовим снимок для чтения…")
-            schedule(0)
-        }
+    private fun showItems(items: List<OverlayView.Item>) {
+        translatedItems = items
+        overlay?.setItems(items)
+        restoreOverlay()
+        updateMasks()
     }
-
-    private fun applyMode() {
-        val params = overlayParams ?: return
-        params.alpha = if (frozen) 1f else liveAlpha()
-        params.flags = if (frozen) params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        else params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        overlay?.let { window.updateViewLayout(it, params) }
-        modeButton?.text = if (frozen) "Вернуться в Live" else "Снимок"
-    }
-
-    private fun restoreWindows() {
-        if (stopping) return
-        overlay?.visibility = View.VISIBLE
-        controls?.visibility = View.VISIBLE
-    }
-
-    private fun onSceneChanged() {
-        if (stopping || frozen || projection == null) return
-        frames.invalidate()
+    private fun clearOverlay() {
         translatedItems = emptyList()
         overlay?.setItems(emptyList())
-        restoreWindows()
+        restoreOverlay()
         updateMasks()
-        schedule(100)
     }
-
+    private fun restoreOverlay() {
+        overlay?.visibility = if (stopping || paused || !captureVisible || translatedItems.isEmpty())
+            View.INVISIBLE else View.VISIBLE
+    }
+    private fun invalidateFrame() {
+        activeToken?.let { capture.cancel(it) }
+        activeToken = null
+        timeout?.let { main.removeCallbacks(it) }
+        timeout = null
+        frames.invalidate()
+        main.removeCallbacks(scanTask)
+        capture.stopMonitoring()
+    }
+    private fun togglePause() {
+        paused = !paused
+        invalidateFrame()
+        clearOverlay()
+        setStatus(if (paused) "Перевод на паузе" else "Перевод включён")
+        if (!paused) schedule(0)
+    }
+    private fun onSceneChanged() {
+        if (stopping || paused || !captureVisible || projection == null) return
+        invalidateFrame()
+        clearOverlay()
+        schedule(40)
+    }
     private fun updateMasks() {
+        val bounds = contentBounds()
         val masks = translatedItems.map { Rect(it.rect) }.toMutableList()
-        controls?.let { bar ->
-            val at = IntArray(2)
-            bar.getLocationOnScreen(at)
-            masks.add(Rect(
-                (at[0].toFloat() * captureWidth / screenWidth).toInt(),
-                (at[1].toFloat() * captureHeight / screenHeight).toInt(),
-                ((at[0] + bar.width).toFloat() * captureWidth / screenWidth).toInt(),
-                ((at[1] + bar.height).toFloat() * captureHeight / screenHeight).toInt()
-            ))
-        }
+        masks.add(Rect(0, 0, captureWidth, bounds.top))
+        masks.add(Rect(0, bounds.bottom, captureWidth, captureHeight))
         capture.setMasks(masks)
-    }
-
-    private fun showFullText() {
-        if (translatedItems.isEmpty()) {
-            Toast.makeText(this, "На снимке пока нет готового перевода", Toast.LENGTH_SHORT).show()
-            return
-        }
-        detail?.dismiss()
-        val text = TextView(this).apply {
-            this.text = translatedItems.joinToString("\n\n") { it.text }
-            textSize = 18f
-            setTextIsSelectable(true)
-            setPadding(dp(20), dp(12), dp(20), dp(12))
-        }
-        val scroll = ScrollView(this).apply { addView(text) }
-        detail = AlertDialog.Builder(this).setTitle("Полный перевод")
-            .setView(scroll).setPositiveButton("Закрыть", null).create().also {
-                it.window?.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
-                it.show()
-            }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         main.removeCallbacks(resizeTask)
-        main.postDelayed(resizeTask, 120)
+        main.postDelayed(resizeTask, 80)
     }
-
     private fun resizeCapture() {
         if (stopping || display == null) return
         val oldWidth = screenWidth
         val oldHeight = screenHeight
         updateDimensions()
         if (oldWidth == screenWidth && oldHeight == screenHeight) return
-        frames.invalidate()
-        frozen = false
-        freezeRequested = false
-        detail?.dismiss()
-        detail = null
-        translatedItems = emptyList()
-        overlay?.setItems(emptyList())
-        overlay?.setSnapshot(null)
+        invalidateFrame()
+        clearOverlay()
         try {
             val surface = capture.attach(captureWidth, captureHeight)
             display?.resize(captureWidth, captureHeight, resources.displayMetrics.densityDpi)
             display?.surface = surface
             overlay?.setCaptureSize(captureWidth, captureHeight, screenWidth, screenHeight)
-            applyMode()
-            restoreWindows()
+            overlay?.requestApplyInsets()
             updateMasks()
-            schedule(180)
+            schedule(40)
         } catch (_: Exception) { stopWithMessage("Не удалось обновить захват после поворота экрана.") }
     }
-
     private fun schedule(delayMs: Long) {
         main.removeCallbacks(scanTask)
-        if (!stopping && !frozen && projection != null) main.postDelayed(scanTask, delayMs)
+        if (!stopping && !paused && captureVisible && projection != null) main.postDelayed(scanTask, delayMs)
     }
+    private fun canNotify() = Build.VERSION.SDK_INT < 33 ||
+        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
     private fun setStatus(message: String, elapsedMs: Long? = null) {
-        TranslationStatus.update(TranslationStatus.State(true, frozen, message, elapsedMs))
-        if (message != lastNotification) {
-            lastNotification = message
-            if (Build.VERSION.SDK_INT < 33 ||
-                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
-            }
+        TranslationStatus.update(TranslationStatus.State(true, paused, message, elapsedMs))
+        val key = message + "|" + paused
+        if (key != lastNotification && canNotify()) {
+            lastNotification = key
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
         }
     }
+    private fun openApp(resume: Boolean = false): PendingIntent = PendingIntent.getActivity(
+        this, if (resume) 20 else 10, Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            if (resume) action = ACTION_RESUME_CAPTURE
+        }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
     private fun notification(message: String): Notification {
         fun action(action: String, code: Int) = PendingIntent.getService(
             this, code, Intent(this, TranslatorService::class.java).setAction(action),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setContentTitle("Screen Translator")
             .setContentText(message)
             .setSmallIcon(android.R.drawable.ic_menu_search)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setContentIntent(PendingIntent.getActivity(
-                this, 10, Intent(this, MainActivity::class.java),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            ))
-            .addAction(Notification.Action.Builder(null, if (frozen) "Live" else "Снимок", action(ACTION_TOGGLE, 11)).build())
-            .addAction(Notification.Action.Builder(null, "Остановить", action(ACTION_STOP, 12)).build())
+            .setOngoing(true).setOnlyAlertOnce(true)
+            .setContentIntent(openApp())
+            .addAction(Notification.Action.Builder(null, if (paused) "Продолжить" else "Пауза",
+                action(ACTION_PAUSE, 11)).build())
+            .addAction(Notification.Action.Builder(null, "Выключить", action(ACTION_STOP, 12)).build())
             .build()
     }
+    private fun recoveryNotification(): Notification = Notification.Builder(this, CHANNEL)
+        .setContentTitle("Перевод остановлен системой")
+        .setContentText("После записи экрана нажмите «Возобновить».")
+        .setStyle(Notification.BigTextStyle().bigText(
+            "Android завершил захват: это возможно при другой записи экрана, блокировке или остановке через систему. " +
+                "Завершите другую запись и разрешите захват снова."))
+        .setSmallIcon(android.R.drawable.ic_menu_search)
+        .setAutoCancel(true).setContentIntent(openApp(true))
+        .addAction(Notification.Action.Builder(null, "Возобновить", openApp(true)).build())
+        .build()
 
     private fun stopWithMessage(message: String) {
         stopMessage = message
         stopping = true
+        invalidateFrame()
         frames.stop()
-        TranslationStatus.update(TranslationStatus.State(message = message))
+        TranslationStatus.update(TranslationStatus.State(message = message, needsCapture = interrupted))
         stopSelf()
     }
-
     override fun onDestroy() {
         stopping = true
+        invalidateFrame()
         frames.stop()
         main.removeCallbacksAndMessages(null)
-        detail?.dismiss()
-        detail = null
-        try { controls?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
         try { overlay?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
-        overlay?.setSnapshot(null)
         analyzer.close()
         capture.close()
         display?.release()
@@ -434,13 +394,12 @@ class TranslatorService : Service() {
         projection?.stop()
         display = null
         projection = null
-        controls = null
         overlay = null
         stopForeground(STOP_FOREGROUND_REMOVE)
-        TranslationStatus.update(TranslationStatus.State(message = stopMessage))
+        TranslationStatus.update(TranslationStatus.State(message = stopMessage, needsCapture = interrupted))
+        if (interrupted && canNotify())
+            getSystemService(NotificationManager::class.java).notify(RECOVERY_ID, recoveryNotification())
         super.onDestroy()
     }
-
     override fun onBind(intent: Intent?) = null
-    private fun dp(value: Int) = (resources.displayMetrics.density * value + 0.5f).toInt()
 }

@@ -3,8 +3,8 @@ package com.arc6323.screentranslator
 /** Only the current frame may publish, finish, or schedule more work. */
 class FrameGuard {
     private var serial = 0L
-    private var active: Long? = null
-    private var stopped = true
+    @Volatile private var active: Long? = null
+    @Volatile private var stopped = true
     fun start() { serial++; active = null; stopped = false }
     fun begin(): Long? {
         if (stopped || active != null) return null

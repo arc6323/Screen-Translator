@@ -15,7 +15,6 @@ class OverlayView(context: Context) : View(context) {
     private data class Rendered(val box: RectF, val layout: StaticLayout, val background: Int)
     private var items = emptyList<Item>()
     private var rendered = emptyList<Rendered>()
-    private var snapshot: Bitmap? = null
     private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private var captureWidth = 1
     private var captureHeight = 1
@@ -35,13 +34,6 @@ class OverlayView(context: Context) : View(context) {
     fun setItems(next: List<Item>) {
         items = next.toList()
         rebuild()
-    }
-
-    /** Transfers ownership. Called on the UI thread after the previous draw has completed. */
-    fun setSnapshot(next: Bitmap?) {
-        snapshot = next
-        // Let the renderer release its reference before GC frees a previously drawn bitmap.
-        invalidate()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -100,9 +92,6 @@ class OverlayView(context: Context) : View(context) {
         canvas.save()
         canvas.translate(-location[0].toFloat(), -location[1].toFloat())
         canvas.scale(geometry.scaleX, geometry.scaleY)
-        snapshot?.takeUnless { it.isRecycled }?.let {
-            canvas.drawBitmap(it, null, RectF(0f, 0f, captureWidth.toFloat(), captureHeight.toFloat()), null)
-        }
         for (item in rendered) {
             backgroundPaint.color = item.background
             backgroundPaint.alpha = 255

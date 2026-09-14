@@ -1,5 +1,6 @@
 package com.arc6323.screentranslator
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
@@ -7,7 +8,9 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
+import com.google.android.gms.tasks.Task
 import com.google.mlkit.nl.languageid.LanguageIdentification
+import com.google.mlkit.nl.languageid.LanguageIdentificationOptions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
@@ -23,27 +26,35 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.LinkedHashMap
 
-class FrameAnalyzer : AutoCloseable {
+class FrameAnalyzer(context: Context) : AutoCloseable {
     data class Result(val items: List<OverlayView.Item>, val elapsedMs: Long, val unchanged: Boolean, val error: String? = null)
     private data class Block(val text: String, val rect: Rect, val background: Int)
     private val main = Handler(Looper.getMainLooper())
     private val thread = HandlerThread("ocr-preparation").apply { start() }
     private val worker = Handler(thread.looper)
+    private val cyrillic = CyrillicGuard(context)
     private val recognizers = mutableMapOf<String, TextRecognizer>()
-    private val languageId = LanguageIdentification.getClient()
+    private val languageId = LanguageIdentification.getClient(
+        LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.20f).build())
     private val translators = mutableMapOf<String, Translator>()
-    private val cache = object : LinkedHashMap<String, String>(300, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 300
-    }
-    private var closed = false
-    private var ocrBusy = false
+    private val textCache = lru<String, String>(500)
+    private val languageCache = lru<String, List<SourceLanguagePolicy.Candidate>>(500)
+    private val inFlight = mutableMapOf<String, Task<String>>()
+    @Volatile private var closed = false
+    @Volatile private var ocrBusy = false
     val isBusy: Boolean get() = ocrBusy
-    private var previousSignature: String? = null
+    private var previousVisual: String? = null
+    private var previousResult: Result? = null
 
-    /** Takes ownership of bitmap, including early returns and failed OCR. */
+    private fun <K, V> lru(limit: Int) = object : LinkedHashMap<K, V>(limit, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?) = size > limit
+    }
+
+    /** Takes ownership of bitmap. Partial results do not complete the frame. */
     fun analyze(
-        bitmap: Bitmap, selected: Set<String>, target: String,
-        current: () -> Boolean, complete: (Result) -> Unit
+        bitmap: Bitmap, selected: Set<String>, target: String, bounds: Rect,
+        current: () -> Boolean, partial: (List<OverlayView.Item>) -> Unit,
+        complete: (Result) -> Unit
     ) {
         val started = SystemClock.elapsedRealtime()
         if (closed || ocrBusy) {
@@ -52,133 +63,233 @@ class FrameAnalyzer : AutoCloseable {
             return
         }
         ocrBusy = true
+        worker.post {
+            val visual = try {
+                target + "|" + selected.sorted().joinToString() + "|" + pixelKey(bitmap, bounds)
+            } catch (_: RuntimeException) { null }
+            main.post {
+                if (closed || !current()) { bitmap.recycle(); ocrBusy = false; return@post }
+                val previous = previousResult
+                if (visual != null && visual == previousVisual && previous != null) {
+                    bitmap.recycle()
+                    ocrBusy = false
+                    complete(previous.copy(elapsedMs = SystemClock.elapsedRealtime() - started, unchanged = true))
+                } else recognize(bitmap, selected, target, bounds, visual, started, current, partial, complete)
+            }
+        }
+    }
+
+    private fun recognize(
+        bitmap: Bitmap, selected: Set<String>, target: String, bounds: Rect, visual: String?,
+        started: Long, current: () -> Boolean, partial: (List<OverlayView.Item>) -> Unit,
+        complete: (Result) -> Unit
+    ) {
         val scripts = mutableListOf("latin")
-        if ("zh" in selected) scripts.add("zh")
-        if ("hi" in selected) scripts.add("hi")
-        if ("ja" in selected) scripts.add("ja")
-        if ("ko" in selected) scripts.add("ko")
-        val recognized = mutableListOf<Text.TextBlock>()
+        for (script in listOf("zh", "hi", "ja", "ko")) if (script in selected || script == target) scripts.add(script)
+        val lines = mutableListOf<Text.Line>()
+        val batchItems = mutableMapOf<Int, List<OverlayView.Item>>()
+        var pendingBatches = 0
+        var preparationDone = false
+        var frameError: String? = null
         var remaining = scripts.size
         var failures = 0
+        fun allItems() = batchItems.values.flatten().sortedWith(compareBy({ it.rect.top }, { it.rect.left }))
+        fun finishStreaming() {
+            if (!preparationDone || pendingBatches != 0 || closed || !current()) return
+            val result = Result(allItems(), SystemClock.elapsedRealtime() - started, false, frameError)
+            if (frameError == null && visual != null) { previousVisual = visual; previousResult = result }
+            complete(result)
+        }
+        fun submitBatch(id: Int, blocks: List<Block>) {
+            if (blocks.isEmpty()) return
+            main.post {
+                if (closed || !current()) return@post
+                pendingBatches++
+                identify(blocks, selected, target, null, started, null, current,
+                    partial = { items -> batchItems[id] = items; partial(allItems()) },
+                    complete = { result ->
+                        batchItems[id] = result.items
+                        if (result.error != null) frameError = result.error
+                        pendingBatches--
+                        partial(allItems())
+                        finishStreaming()
+                    })
+            }
+        }
         fun finishRecognizer() {
             remaining--
             if (remaining != 0) return
             worker.post {
-                val blocks = try {
-                    recognized.sortedWith(compareBy({ it.boundingBox?.top ?: 0 }, { it.boundingBox?.left ?: 0 }))
-                        .mapNotNull { block ->
-                            val rect = block.boundingBox ?: return@mapNotNull null
-                            val text = block.text.trim()
-                            if (rect.width() <= 0 || rect.height() <= 0 || text.none { it.isLetter() }) null
-                            else Block(text, Rect(rect), sampleBackground(bitmap, rect))
-                        }.fold(mutableListOf<Block>()) { list, block ->
-                            if (list.none { overlaps(it.rect, block.rect) }) list.add(block)
-                            list
+                var guardUnavailable = false
+                var preparationFailed = false
+                cyrillic.beginFrame()
+                try {
+                    val ordered = lines.filter { line ->
+                        val rect = line.boundingBox
+                        rect != null && bounds.contains(rect) && rect.width() > 0 && rect.height() > 0 &&
+                            line.text.count { it.isLetter() } >= 2 && line.confidence >= 0.55f
+                    }.sortedWith(compareBy<Text.Line>(
+                        { !SourceLanguagePolicy.containsTargetScript(it.text, target) },
+                        { it.boundingBox?.top ?: 0 }, { it.boundingBox?.left ?: 0 }))
+                    val unique = mutableListOf<Text.Line>()
+                    ordered.forEach { line ->
+                        if (unique.none { overlaps(it.boundingBox!!, line.boundingBox!!) }) unique.add(line)
+                    }
+                    var batch = mutableListOf<Block>()
+                    var batchId = 0
+                    unique.sortedBy { it.boundingBox!!.top }.take(64).forEachIndexed { index, line ->
+                        if (closed || !current()) return@forEachIndexed
+                        val rect = line.boundingBox!!
+                        val text = line.text.trim()
+                        var allowed = !SourceLanguagePolicy.containsTargetScript(text, target)
+                        if (allowed && SourceLanguagePolicy.isCyrillicTarget(target)) {
+                            val checked = cyrillic.allows(bitmap, rect, text + "|" + pixelKey(bitmap, rect))
+                            if (checked == null) guardUnavailable = true
+                            allowed = checked == true
                         }
+                        if (allowed) batch.add(Block(text, Rect(rect), sampleBackground(bitmap, rect)))
+                        if (index % 4 == 3) {
+                            submitBatch(batchId++, batch.toList())
+                            batch = mutableListOf()
+                        }
+                    }
+                    submitBatch(batchId, batch.toList())
                 } catch (_: RuntimeException) {
-                    emptyList()
+                    preparationFailed = true
                 } finally {
+                    cyrillic.endFrame()
                     bitmap.recycle()
                 }
                 main.post {
                     ocrBusy = false
                     if (closed || !current()) return@post
-                    if (failures == scripts.size) {
-                        complete(Result(emptyList(), SystemClock.elapsedRealtime() - started, false, "Ошибка распознавания текста"))
-                    } else identify(blocks, selected, target, started, current, complete)
+                    when {
+                        failures == scripts.size || preparationFailed -> frameError = "Не удалось распознать текст"
+                        guardUnavailable -> frameError = "Не удалось проверить кириллицу. Перезапустите перевод."
+                    }
+                    preparationDone = true
+                    finishStreaming()
                 }
             }
         }
         scripts.forEach { script ->
             try {
                 recognizer(script).process(InputImage.fromBitmap(bitmap, 0))
-                    .addOnSuccessListener { recognized.addAll(it.textBlocks) }
+                    .addOnSuccessListener { result -> lines.addAll(result.textBlocks.flatMap { it.lines }) }
                     .addOnFailureListener { failures++ }
                     .addOnCompleteListener { finishRecognizer() }
-            } catch (_: RuntimeException) {
-                failures++
-                finishRecognizer()
-            }
+            } catch (_: RuntimeException) { failures++; finishRecognizer() }
         }
     }
 
     private fun identify(
-        blocks: List<Block>, selected: Set<String>, target: String, started: Long,
-        current: () -> Boolean, complete: (Result) -> Unit
+        blocks: List<Block>, selected: Set<String>, target: String, visual: String?,
+        started: Long, error: String?, current: () -> Boolean,
+        partial: (List<OverlayView.Item>) -> Unit, complete: (Result) -> Unit
     ) {
-        if (blocks.isEmpty()) {
-            previousSignature = null
-            complete(Result(emptyList(), SystemClock.elapsedRealtime() - started, false))
-            return
+        val choices = mutableMapOf<String, List<SourceLanguagePolicy.Candidate>>()
+        val texts = blocks.map { it.text }.distinct()
+        var remaining = texts.size
+        fun ready() {
+            if (closed || !current()) return
+            val matches = blocks.mapNotNull { block ->
+                val source = SourceLanguagePolicy.source(block.text, choices[block.text].orEmpty(), selected, target)
+                if (source == null || TranslateLanguage.fromLanguageTag(source) == null) null else block to source
+            }
+            translate(matches, target, visual, started, error, current, partial, complete)
         }
-        // Bound language-ID work separately from the budget of translatable blocks.
-        val candidates = blocks.take(80)
-        val sources = Array(candidates.size) { "und" }
-        var remaining = candidates.size
-        candidates.forEachIndexed { index, block ->
-            languageId.identifyLanguage(block.text)
-                .addOnSuccessListener { sources[index] = it }
-                .addOnCompleteListener {
-                    remaining--
-                    if (remaining == 0 && !closed && current()) {
-                        val fallback = selected.filter { it != target && LanguageCacheManager.supportsScreenOcr(it) }.singleOrNull()
-                        val matches = candidates.indices.mapNotNull { position ->
-                            val source = sources[position].let { if (it == "und") fallback ?: it else it }
-                            if (source in selected && source != target && TranslateLanguage.fromLanguageTag(source) != null) {
-                                candidates[position] to source
-                            } else null
-                        }.take(24)
-                        translate(matches, target, started, current, complete)
-                    }
+        if (texts.isEmpty()) { ready(); return }
+        texts.forEach { text ->
+            val cached = languageCache[text]
+            if (cached != null) {
+                choices[text] = cached
+                remaining--
+                if (remaining == 0) ready()
+            } else languageId.identifyPossibleLanguages(text)
+                .addOnSuccessListener { identified ->
+                    val result = identified.map { SourceLanguagePolicy.Candidate(it.languageTag, it.confidence) }
+                    if (!closed) languageCache[text] = result
+                    choices[text] = result
                 }
+                .addOnCompleteListener { remaining--; if (remaining == 0) ready() }
         }
     }
 
     private fun translate(
-        blocks: List<Pair<Block, String>>, target: String, started: Long,
-        current: () -> Boolean, complete: (Result) -> Unit
+        blocks: List<Pair<Block, String>>, target: String, visual: String?, started: Long,
+        priorError: String?, current: () -> Boolean, partial: (List<OverlayView.Item>) -> Unit,
+        complete: (Result) -> Unit
     ) {
-        val signature = target + blocks.joinToString { (block, source) -> "$source|${block.rect}|${block.text}" }
-        val unchanged = signature == previousSignature
         val items = mutableListOf<OverlayView.Item>()
         var remaining = blocks.size
         var failures = 0
+        var partialScheduled = false
+        fun sorted() = items.sortedWith(compareBy({ it.rect.top }, { it.rect.left }))
+        fun publish() {
+            if (partialScheduled || closed || !current()) return
+            partialScheduled = true
+            main.postDelayed({
+                partialScheduled = false
+                if (!closed && current()) partial(sorted())
+            }, 16)
+        }
         fun finish() {
             if (closed || !current()) return
-            if (failures == 0) previousSignature = signature
-            complete(Result(items.sortedWith(compareBy({ it.rect.top }, { it.rect.left })),
-                SystemClock.elapsedRealtime() - started, unchanged,
-                if (failures > 0) "Не удалось перевести блоков: $failures. Проверьте языковые модели." else null))
+            val error = priorError ?: if (failures > 0) "Часть строк не переведена. Проверьте модели." else null
+            val result = Result(sorted(), SystemClock.elapsedRealtime() - started, false, error)
+            if (error == null && visual != null) { previousVisual = visual; previousResult = result }
+            complete(result)
         }
         if (blocks.isEmpty()) { finish(); return }
         fun result(block: Block, text: String?) {
             if (text == null) failures++
             else if (text.isNotBlank() && text.trim() != block.text.trim()) {
                 items.add(OverlayView.Item(block.rect, text.trim(), block.background))
+                publish()
             }
             remaining--
             if (remaining == 0) finish()
         }
         blocks.forEach { (block, source) ->
-            val key = "$source|$target|${block.text}"
-            val cached = cache[key]
+            val key = source + "|" + target + "|" + block.text
+            val cached = textCache[key]
             if (cached != null) result(block, cached)
             else try {
-                val pair = "$source->$target"
-                val translator = translators.getOrPut(pair) {
-                    Translation.getClient(TranslatorOptions.Builder()
-                        .setSourceLanguage(TranslateLanguage.fromLanguageTag(source)!!)
-                        .setTargetLanguage(TranslateLanguage.fromLanguageTag(target)!!).build())
-                }
-                // Model availability is checked before capture; no network download inside a frame.
-                translator.translate(block.text)
-                    .addOnSuccessListener {
-                        if (!closed && current()) cache[key] = it
-                        result(block, it)
+                val task = inFlight.getOrPut(key) {
+                    val translator = translators.getOrPut(source + "->" + target) {
+                        Translation.getClient(TranslatorOptions.Builder()
+                            .setSourceLanguage(TranslateLanguage.fromLanguageTag(source)!!)
+                            .setTargetLanguage(TranslateLanguage.fromLanguageTag(target)!!).build())
                     }
+                    translator.translate(block.text).also { task ->
+                        // Keep successful work even if a newer frame has superseded its screen coordinates.
+                        task.addOnSuccessListener { if (!closed) textCache[key] = it }
+                        task.addOnCompleteListener { inFlight.remove(key) }
+                    }
+                }
+                task.addOnSuccessListener { result(block, it) }
                     .addOnFailureListener { result(block, null) }
             } catch (_: RuntimeException) { result(block, null) }
         }
+    }
+
+    /** Stable content key independent of screen position, to reuse checks while scrolling. */
+    private fun pixelKey(bitmap: Bitmap, bounds: Rect): String {
+        val r = Rect(bounds)
+        if (!r.intersect(0, 0, bitmap.width, bitmap.height)) return "empty"
+        val row = IntArray(r.width())
+        var hash = -3750763034362895579L
+        var second = 1125899906842597L
+        var y = r.top
+        while (y < r.bottom) {
+            bitmap.getPixels(row, 0, row.size, r.left, y, row.size, 1)
+            for (x in row.indices step 2) {
+                hash = (hash xor row[x].toLong()) * 1099511628211L
+                second = second * 31 + row[x]
+            }
+            y += 2
+        }
+        return r.width().toString() + "x" + r.height() + ":" + hash + ":" + second
     }
 
     private fun recognizer(script: String) = recognizers.getOrPut(script) {
@@ -218,17 +329,20 @@ class FrameAnalyzer : AutoCloseable {
 
     override fun close() {
         closed = true
+        fun release() {
+            if (ocrBusy) { main.postDelayed({ closeWhenIdle() }, 100); return }
+            worker.post { cyrillic.close(); thread.quitSafely() }
+        }
         recognizers.values.forEach { it.close() }
         translators.values.forEach { it.close() }
         languageId.close()
-        cache.clear()
-        // Do not stop the worker while an OCR completion still owns a Bitmap.
-        if (ocrBusy) main.postDelayed({ finishClosingWorker() }, 200)
-        else thread.quitSafely()
+        textCache.clear()
+        languageCache.clear()
+        inFlight.clear()
+        release()
     }
-
-    private fun finishClosingWorker() {
-        if (ocrBusy) main.postDelayed({ finishClosingWorker() }, 200)
-        else thread.quitSafely()
+    private fun closeWhenIdle() {
+        if (ocrBusy) main.postDelayed({ closeWhenIdle() }, 100)
+        else worker.post { cyrillic.close(); thread.quitSafely() }
     }
 }

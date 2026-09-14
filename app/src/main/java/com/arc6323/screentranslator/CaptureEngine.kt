@@ -10,25 +10,19 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
 
-/** Owns image buffers on a worker thread and keeps draining the producer between requests. */
-class CaptureEngine(
-    private val main: Handler,
-    private val sceneChanged: () -> Unit
-) : AutoCloseable {
+/** Owns one latest Image on its worker; a static screen does not have to produce another frame. */
+class CaptureEngine(private val main: Handler, private val sceneChanged: () -> Unit) : AutoCloseable {
     private val thread = HandlerThread("screen-capture").apply { start() }
     private val worker = Handler(thread.looper)
     @Volatile private var closed = false
     @Volatile private var reader: ImageReader? = null
+    private var latest: Image? = null
     private data class Request(
-        val token: Long,
-        val afterTimestamp: Long,
-        val result: (Bitmap) -> Unit,
-        var armed: Boolean = false,
-        var candidate: Bitmap? = null
+        val token: Long, val afterTimestamp: Long, val requireFresh: Boolean,
+        val result: (Bitmap) -> Unit, var armed: Boolean = false
     )
     private data class Fingerprint(val width: Int, val height: Int, val shades: IntArray)
     private var pending: Request? = null
-    private var lastTimestamp = Long.MIN_VALUE
     private var watching: Fingerprint? = null
     private var masks = emptyList<Rect>()
     private val columns = 24
@@ -38,96 +32,65 @@ class CaptureEngine(
         val next = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
         val previous = reader
         reader = next
-        next.setOnImageAvailableListener({ source -> read(source) }, worker)
         worker.post {
+            latest?.close()
+            latest = null
             previous?.close()
-            pending?.candidate?.recycle()
             pending = null
             watching = null
-            lastTimestamp = Long.MIN_VALUE
+            next.setOnImageAvailableListener({ source -> read(source) }, worker)
         }
         return next.surface
     }
-
-    /** Prepared runs on main before the UI hides its windows. */
-    fun request(token: Long, prepared: () -> Unit, result: (Bitmap) -> Unit) {
+    fun request(token: Long, requireFresh: Boolean, prepared: () -> Unit, result: (Bitmap) -> Unit) {
         worker.post {
             if (closed) return@post
-            pending?.candidate?.recycle()
-            pending = null
             watching = null
-            try {
-                reader?.acquireLatestImage()?.use { lastTimestamp = maxOf(lastTimestamp, it.timestamp) }
-            } catch (_: IllegalStateException) {}
-            pending = Request(token, lastTimestamp, result)
+            pending = Request(token, latest?.timestamp ?: Long.MIN_VALUE, requireFresh, result)
             main.post { if (!closed) prepared() }
         }
     }
-
-    /** Called after two UI animation frames, not after an arbitrary sleep. */
     fun arm(token: Long) {
         worker.post {
-            pending?.takeIf { it.token == token }?.let {
-                it.armed = true
-                deliver(it)
-            }
+            try { pending?.takeIf { it.token == token }?.let { it.armed = true; deliver(it) } }
+            catch (_: RuntimeException) { /* A later producer frame or timeout will retry. */ }
         }
     }
-
-    fun cancel(token: Long) {
-        worker.post {
-            if (pending?.token == token) {
-                pending?.candidate?.recycle()
-                pending = null
-            }
-        }
-    }
-
+    fun cancel(token: Long) { worker.post { if (pending?.token == token) pending = null } }
     fun setMasks(rects: List<Rect>) {
         val copy = rects.map { Rect(it).apply { inset(-16, -16) } }
         worker.post { masks = copy }
     }
-
     fun stopMonitoring() { worker.post { watching = null } }
 
     private fun read(source: ImageReader) {
-        var image: Image? = null
+        var acquired: Image? = null
         try {
-            image = source.acquireLatestImage() ?: return
+            acquired = source.acquireLatestImage() ?: return
             if (closed || source !== reader) return
-            lastTimestamp = maxOf(lastTimestamp, image.timestamp)
+            latest?.close()
+            latest = acquired
+            acquired = null
             val request = pending
-            if (request != null) {
-                if (image.timestamp <= request.afterTimestamp) return
-                val bitmap = toBitmap(image)
-                request.candidate?.recycle()
-                request.candidate = bitmap
-                deliver(request)
-            } else {
-                val reference = watching
-                if (reference != null && differs(image, reference)) {
+            if (request != null) deliver(request)
+            else watching?.let { reference ->
+                if (differs(latest!!, reference)) {
                     watching = null
                     main.post { if (!closed) sceneChanged() }
                 }
             }
-        } catch (_: IllegalStateException) {
-            // A surface may be replaced during rotation. The UI request has a bounded timeout.
         } catch (_: RuntimeException) {
-            // Buffer errors are reported by the same timeout, without wedging the producer.
-        } finally {
-            image?.close()
-        }
+            // Surface replacement and capture shutdown race with producer callbacks.
+        } finally { acquired?.close() }
     }
-
     private fun deliver(request: Request) {
-        val bitmap = request.candidate ?: return
-        if (!request.armed || pending !== request) return
+        val image = latest ?: return
+        if (!request.armed || pending !== request ||
+            (request.requireFresh && image.timestamp <= request.afterTimestamp)) return
+        val bitmap = toBitmap(image)
         pending = null
-        request.candidate = null
         watching = fingerprint(bitmap)
-        main.post {
-            if (closed) bitmap.recycle() else request.result(bitmap)
-        }
+        main.post { if (closed) bitmap.recycle() else request.result(bitmap) }
     }
 
     private fun fingerprint(bitmap: Bitmap): Fingerprint {
@@ -188,9 +151,10 @@ class CaptureEngine(
     override fun close() {
         closed = true
         worker.post {
-            pending?.candidate?.recycle()
             pending = null
             watching = null
+            latest?.close()
+            latest = null
             reader?.close()
             reader = null
             thread.quitSafely()
