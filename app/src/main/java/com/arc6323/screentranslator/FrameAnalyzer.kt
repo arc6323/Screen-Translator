@@ -65,7 +65,7 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
         ocrBusy = true
         worker.post {
             val visual = try {
-                target + "|" + selected.sorted().joinToString() + "|" + pixelKey(bitmap, bounds)
+                target + "|" + selected.sorted().joinToString() + "|" + bounds.toShortString() + "|" + pixelKey(bitmap, bounds)
             } catch (_: RuntimeException) { null }
             main.post {
                 if (closed || !current()) { bitmap.recycle(); ocrBusy = false; return@post }
@@ -141,8 +141,8 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
                         if (closed || !current()) return@forEachIndexed
                         val rect = line.boundingBox!!
                         val text = line.text.trim()
-                        var allowed = !SourceLanguagePolicy.containsTargetScript(text, target)
-                        if (allowed && SourceLanguagePolicy.isCyrillicTarget(target)) {
+                        var allowed = !SourceLanguagePolicy.definitelyTargetScript(text, target, selected)
+                        if (allowed && SourceLanguagePolicy.needsCyrillicCheck(text, target)) {
                             val checked = cyrillic.allows(bitmap, rect, text + "|" + pixelKey(bitmap, rect))
                             if (checked == null) guardUnavailable = true
                             allowed = checked == true
@@ -283,11 +283,11 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
         var y = r.top
         while (y < r.bottom) {
             bitmap.getPixels(row, 0, row.size, r.left, y, row.size, 1)
-            for (x in row.indices step 2) {
+            for (x in row.indices) {
                 hash = (hash xor row[x].toLong()) * 1099511628211L
                 second = second * 31 + row[x]
             }
-            y += 2
+            y++
         }
         return r.width().toString() + "x" + r.height() + ":" + hash + ":" + second
     }

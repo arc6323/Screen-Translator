@@ -23,12 +23,13 @@ class CyrillicGuard(context: Context) : AutoCloseable {
         try {
             val root = File(app.filesDir, "ocr-guard-v1")
             val data = File(root, "tessdata").apply { mkdirs() }
-            for (name in listOf("eng.traineddata", "rus.traineddata")) {
+            for ((name, size) in mapOf("eng.traineddata" to 4113088L, "rus.traineddata" to 3861738L)) {
                 val file = File(data, name)
                 app.assets.open("ocr-guard/$name").use { input ->
-                    if (!file.exists() || file.length() != input.available().toLong()) {
+                    if (!file.exists() || file.length() != size) {
                         val temporary = File(data, "$name.tmp")
                         temporary.outputStream().use { input.copyTo(it) }
+                        check(temporary.length() == size) { "Incomplete OCR model" }
                         check(temporary.renameTo(file)) { "Cannot install OCR model" }
                     }
                 }

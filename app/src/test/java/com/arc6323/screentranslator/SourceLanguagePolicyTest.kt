@@ -35,4 +35,14 @@ class SourceLanguagePolicyTest {
         assertNull(SourceLanguagePolicy.source("Q", listOf(choice("en")), setOf("en"), "ru"))
         assertNull(SourceLanguagePolicy.source("12345", listOf(choice("en")), setOf("en"), "ru"))
     }
+    @Test fun cyrillicGuardDoesNotRejectOtherRecognizedScripts() {
+        assertTrue(SourceLanguagePolicy.needsCyrillicCheck("Home", "ru"))
+        assertFalse(SourceLanguagePolicy.needsCyrillicCheck("こんにちは", "ru"))
+        assertFalse(SourceLanguagePolicy.needsCyrillicCheck("你好", "ru"))
+        assertFalse(SourceLanguagePolicy.needsCyrillicCheck("नमस्ते", "ru"))
+    }
+    @Test fun sharedHanScriptDoesNotDisableChineseToJapaneseTranslation() {
+        assertEquals("zh", SourceLanguagePolicy.source("你好世界", listOf(choice("zh")), setOf("zh"), "ja"))
+        assertEquals("ja", SourceLanguagePolicy.source("今日は良い日です", listOf(choice("ja")), setOf("ja"), "zh"))
+    }
 }

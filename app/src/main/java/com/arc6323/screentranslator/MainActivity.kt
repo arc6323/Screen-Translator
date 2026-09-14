@@ -183,7 +183,7 @@ class MainActivity : Activity() {
         LanguageCacheManager.refresh()
         if (notificationSettingsPending) {
             notificationSettingsPending = false
-            if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) resumeRequested = true
+            if (notificationsEnabled()) resumeRequested = true
         }
         if (resumeRequested) {
             resumeRequested = false
@@ -335,9 +335,15 @@ class MainActivity : Activity() {
         }.show()
     }
 
+    private fun notificationsEnabled(): Boolean {
+        val manager = getSystemService(NotificationManager::class.java)
+        return manager.areNotificationsEnabled() &&
+            manager.getNotificationChannel("translator")?.importance != NotificationManager.IMPORTANCE_NONE
+    }
+
     private fun requestOverlayAndCapture() {
         if (captureRequested || TranslationStatus.state.running || isFinishing) return
-        if (!getSystemService(NotificationManager::class.java).areNotificationsEnabled()) {
+        if (!notificationsEnabled()) {
             if (Build.VERSION.SDK_INT >= 33 &&
                 !getPreferences(MODE_PRIVATE).getBoolean("notifications_asked", false)) {
                 getPreferences(MODE_PRIVATE).edit().putBoolean("notifications_asked", true).apply()
@@ -348,8 +354,12 @@ class MainActivity : Activity() {
                     .setNegativeButton("Отмена", null)
                     .setPositiveButton("Открыть настройки") { _, _ ->
                         notificationSettingsPending = true
-                        startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+                        val manager = getSystemService(NotificationManager::class.java)
+                        val channelDisabled = manager.getNotificationChannel("translator")?.importance == NotificationManager.IMPORTANCE_NONE
+                        startActivity(Intent(if (channelDisabled) Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+                            else Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                            .putExtra(Settings.EXTRA_CHANNEL_ID, "translator"))
                     }.show()
             }
             return

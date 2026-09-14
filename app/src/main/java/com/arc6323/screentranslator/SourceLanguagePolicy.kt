@@ -28,9 +28,23 @@ object SourceLanguagePolicy {
         }
         return false
     }
+    fun needsCyrillicCheck(text: String, target: String) =
+        isCyrillicTarget(target) && text.any { it.isLetter() } && text.filter { it.isLetter() }.all {
+            Character.UnicodeScript.of(it.code) == Character.UnicodeScript.LATIN
+        }
+    fun definitelyTargetScript(text: String, target: String, selected: Set<String>): Boolean {
+        if (!containsTargetScript(text, target)) return false
+        val sources = selected.map(::base)
+        // Han is shared: allow language identification to distinguish Chinese and Japanese.
+        if (base(target) == "zh" && "ja" in sources) return false
+        if (base(target) == "ja" && "zh" in sources && text.none {
+            Character.UnicodeScript.of(it.code) in setOf(Character.UnicodeScript.HIRAGANA, Character.UnicodeScript.KATAKANA)
+        }) return false
+        return true
+    }
     fun source(text: String, choices: List<Candidate>, selected: Set<String>, target: String): String? {
         val destination = base(target)
-        if (text.count { it.isLetter() } < 2 || containsTargetScript(text, destination)) return null
+        if (text.count { it.isLetter() } < 2 || definitelyTargetScript(text, destination, selected)) return null
         val ranked = choices.filter { it.confidence.isFinite() }.sortedByDescending { it.confidence }
         // A plausible target-language interpretation always wins over translating it again.
         if (ranked.any { base(it.language) == destination && it.confidence >= 0.20f }) return null
