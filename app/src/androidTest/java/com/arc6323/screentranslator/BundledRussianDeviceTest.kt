@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 class BundledRussianDeviceTest {
     @Test fun tokenizationMatchesThePinnedReference() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val tokenizer = UnigramTokenizer(context.assets.open("russian/tokenizer.json"))
+        val tokenizer = UnigramTokenizer(context.assets.open("russian/tokenizer.bin"))
         assertArrayEquals(longArrayOf(160, 5270, 2, 508, 55, 33, 19, 0), tokenizer.encode("Hello, how are you?"))
         assertArrayEquals(longArrayOf(5788, 20298, 0), tokenizer.encode("Open settings"))
         assertArrayEquals(longArrayOf(2013, 9771, 3, 0), tokenizer.encode("  Good\n evening.  "))

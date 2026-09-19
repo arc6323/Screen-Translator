@@ -86,6 +86,7 @@ val prepareRussianModel by tasks.registering {
     )
     inputs.property("revision", revision)
     inputs.property("models", models)
+    inputs.file(rootProject.file("scripts/compile_tokenizer.py"))
     outputs.dir(russianAssets)
     doLast {
         val directory = russianAssets.get().dir("russian").asFile.apply { mkdirs() }
@@ -108,6 +109,14 @@ val prepareRussianModel by tasks.registering {
             check(valid(temporary)) { "Bundled Russian model checksum mismatch: $path" }
             check(temporary.renameTo(output)) { "Cannot install verified Russian asset" }
         }
+        exec {
+            commandLine("python3", rootProject.file("scripts/compile_tokenizer.py"),
+                directory.resolve("tokenizer.json"), directory.resolve("tokenizer.bin"))
+        }
+        val compiledDigest = MessageDigest.getInstance("SHA-256").digest(directory.resolve("tokenizer.bin").readBytes())
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+        check(compiledDigest == "148cd45d68d9702a4e64e594ff13ffefe30aea383b9cb052a61bcabfd8041ed7")
+        check(directory.resolve("tokenizer.json").delete())
     }
 }
 android.sourceSets.getByName("main").assets.srcDir(russianAssets)

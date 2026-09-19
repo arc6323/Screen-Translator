@@ -38,7 +38,7 @@ class BundledRussianTranslator(context: Context) : AutoCloseable {
     }
     private fun prepare() {
         if (encoder != null && decoder != null) return
-        tokenizer = UnigramTokenizer(app.assets.open("russian/tokenizer.json"))
+        tokenizer = UnigramTokenizer(app.assets.open("russian/tokenizer.bin"))
         fun model(name: String, size: Long): String {
             val directory = File(app.noBackupFilesDir, "opus-en-ru-e050376").apply { mkdirs() }
             val file = File(directory, name)
