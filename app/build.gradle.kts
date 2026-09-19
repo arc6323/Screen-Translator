@@ -11,8 +11,8 @@ android {
         applicationId = "com.arc6323.screentranslator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -29,6 +29,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
@@ -74,3 +75,40 @@ val prepareOcrGuard by tasks.registering {
 }
 android.sourceSets.getByName("main").assets.srcDir(ocrAssets)
 tasks.named("preBuild").configure { dependsOn(prepareOcrGuard) }
+
+val russianAssets = layout.buildDirectory.dir("generated/russianAssets")
+val prepareRussianModel by tasks.registering {
+    val revision = "e050376e960175e8ddc5cff85025dc8436cddd68"
+    val models = mapOf(
+        "onnx/encoder_model_quantized.onnx" to "97f28d8295d231b7da721ded06fa8c034787df2122cd8f85b904abdc4d15bd53",
+        "onnx/decoder_model_merged_quantized.onnx" to "7efefcd793a5663bc204224a92a123524f3dfe2ffad59e5f73d6734d1b11ad04",
+        "tokenizer.json" to "981cd3d9fef6bb4dda8082afda716b65deb6717cb3ef35ac0b57002c09dec2bb"
+    )
+    inputs.property("revision", revision)
+    inputs.property("models", models)
+    outputs.dir(russianAssets)
+    doLast {
+        val directory = russianAssets.get().dir("russian").asFile.apply { mkdirs() }
+        for ((path, expected) in models) {
+            val output = directory.resolve(path.substringAfterLast('/'))
+            fun valid(file: java.io.File): Boolean {
+                if (!file.isFile) return false
+                val digest = MessageDigest.getInstance("SHA-256")
+                file.inputStream().use { source ->
+                    val buffer = ByteArray(65536)
+                    while (true) { val count = source.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
+                }
+                return digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) } == expected
+            }
+            if (valid(output)) continue
+            val temporary = directory.resolve(output.name + ".tmp")
+            val connection = URL("https://huggingface.co/Xenova/opus-mt-en-ru/resolve/$revision/$path")
+                .openConnection().apply { connectTimeout = 30000; readTimeout = 120000 }
+            connection.getInputStream().use { source -> temporary.outputStream().use { source.copyTo(it) } }
+            check(valid(temporary)) { "Bundled Russian model checksum mismatch: $path" }
+            check(temporary.renameTo(output)) { "Cannot install verified Russian asset" }
+        }
+    }
+}
+android.sourceSets.getByName("main").assets.srcDir(russianAssets)
+tasks.named("preBuild").configure { dependsOn(prepareRussianModel) }

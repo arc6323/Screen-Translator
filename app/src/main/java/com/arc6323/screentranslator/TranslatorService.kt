@@ -41,6 +41,8 @@ class TranslatorService : Service() {
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
     private var overlay: OverlayView? = null
+    private var touchObserver: TouchObserver? = null
+    private val interaction = InteractionGate()
     private var paused = false
     private var captureVisible = true
     private var stopping = false
@@ -159,7 +161,7 @@ class TranslatorService : Service() {
             isFocusable = false
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        // Exactly one window, permanently non-touchable. It is also below the keyboard.
+        // Visible window stays below the keyboard; transparent observer contributes zero opacity.
         val params = WindowManager.LayoutParams(
             -1, -1, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -199,6 +201,7 @@ class TranslatorService : Service() {
         overlay = view
         window.addView(view, params)
         view.requestApplyInsets()
+        touchObserver = TouchObserver(this, ::onScreenTouched).also { window.addView(it, it.windowParams()) }
     }
 
     private fun contentBounds() = Rect(
@@ -209,10 +212,11 @@ class TranslatorService : Service() {
 
     private fun scan() {
         if (stopping || paused || !captureVisible || projection == null) return
+        val quietDelay = interaction.delay(SystemClock.uptimeMillis())
+        if (quietDelay > 0) { schedule(quietDelay); return }
         if (analyzer.isBusy) { schedule(40); return }
         val token = frames.begin() ?: return
         activeToken = token
-        val started = SystemClock.elapsedRealtime()
         val watchdog = Runnable {
             if (frames.finish(token)) {
                 activeToken = null
@@ -226,7 +230,8 @@ class TranslatorService : Service() {
         main.postDelayed(watchdog, 1800)
         capture.request(token, requireFresh = overlay?.visibility == View.VISIBLE && translatedItems.isNotEmpty(), prepared = {
             if (frames.accepts(token)) {
-                overlay?.visibility = View.INVISIBLE
+                capture.noteOverlayChange()
+                overlay?.setTextVisible(false)
                 overlay?.postOnAnimation {
                     overlay?.postOnAnimation { if (frames.accepts(token)) capture.arm(token) }
                 }
@@ -234,7 +239,7 @@ class TranslatorService : Service() {
         }, result = { bitmap ->
             if (!frames.accepts(token)) { bitmap.recycle(); return@request }
             main.removeCallbacks(watchdog)
-            main.postDelayed(watchdog, 15000)
+            main.postDelayed(watchdog, 45000)
             restoreOverlay()
             analyzer.analyze(
                 bitmap, LanguageCacheManager.selected(this), LanguageCacheManager.targetLanguage(this),
@@ -251,27 +256,31 @@ class TranslatorService : Service() {
                     val message = result.error ?: if (result.items.isEmpty())
                         "Ждём текст выбранного исходного языка" else "Перевод включён"
                     setStatus(message, result.elapsedMs)
-                    schedule(LoopTiming.nextDelay(SystemClock.elapsedRealtime() - started, result.unchanged))
+                    // Motion and touches trigger the next scan. Avoid repeatedly hiding a static translation.
+                    if (result.error != null) schedule(1200)
                 }
             }
         })
     }
 
     private fun showItems(items: List<OverlayView.Item>) {
+        if (translatedItems == items) return
+        capture.noteOverlayChange()
         translatedItems = items
         overlay?.setItems(items)
         restoreOverlay()
         updateMasks()
     }
     private fun clearOverlay() {
+        if (translatedItems.isNotEmpty()) capture.noteOverlayChange()
         translatedItems = emptyList()
         overlay?.setItems(emptyList())
         restoreOverlay()
         updateMasks()
     }
     private fun restoreOverlay() {
-        overlay?.visibility = if (stopping || paused || !captureVisible || translatedItems.isEmpty())
-            View.INVISIBLE else View.VISIBLE
+        overlay?.setTextVisible(true)
+        overlay?.visibility = if (stopping || paused || !captureVisible) View.INVISIBLE else View.VISIBLE
     }
     private fun invalidateFrame() {
         activeToken?.let { capture.cancel(it) }
@@ -280,7 +289,6 @@ class TranslatorService : Service() {
         timeout = null
         frames.invalidate()
         main.removeCallbacks(scanTask)
-        capture.stopMonitoring()
     }
     private fun togglePause() {
         paused = !paused
@@ -291,13 +299,22 @@ class TranslatorService : Service() {
     }
     private fun onSceneChanged() {
         if (stopping || paused || !captureVisible || projection == null) return
+        interaction.motion(SystemClock.uptimeMillis())
         invalidateFrame()
         clearOverlay()
-        schedule(40)
+        schedule(interaction.delay(SystemClock.uptimeMillis()))
+    }
+    private fun onScreenTouched() {
+        if (stopping || paused || projection == null) return
+        interaction.touch(SystemClock.uptimeMillis())
+        invalidateFrame()
+        clearOverlay()
+        schedule(interaction.delay(SystemClock.uptimeMillis()))
     }
     private fun updateMasks() {
         val bounds = contentBounds()
-        val masks = translatedItems.map { Rect(it.rect) }.toMutableList()
+        overlay?.setContentBounds(bounds)
+        val masks = mutableListOf<Rect>()
         masks.add(Rect(0, 0, captureWidth, bounds.top))
         masks.add(Rect(0, bounds.bottom, captureWidth, captureHeight))
         capture.setMasks(masks)
@@ -387,6 +404,8 @@ class TranslatorService : Service() {
         frames.stop()
         main.removeCallbacksAndMessages(null)
         try { overlay?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
+        try { touchObserver?.let { window.removeViewImmediate(it) } } catch (_: Exception) {}
+        touchObserver = null
         analyzer.close()
         capture.close()
         display?.release()

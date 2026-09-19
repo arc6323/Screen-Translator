@@ -8,18 +8,22 @@ import android.text.TextPaint
 import android.text.TextUtils
 import android.view.View
 import kotlin.math.max
-import kotlin.math.min
 
 class OverlayView(context: Context) : View(context) {
-    data class Item(val rect: Rect, val text: String, val background: Int)
-    private data class Rendered(val box: RectF, val layout: StaticLayout, val background: Int)
+    data class Item(
+        val rect: Rect, val text: String, val background: Int,
+        val sourceText: String = text, val available: Rect = rect
+    )
+    private data class Rendered(val box: RectF, val layout: StaticLayout, val top: Float)
     private var items = emptyList<Item>()
     private var rendered = emptyList<Rendered>()
-    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val backgroundPaint = Paint().apply { color = Color.BLACK }
+    private var textVisible = true
     private var captureWidth = 1
     private var captureHeight = 1
     private var screenWidth = 1
     private var screenHeight = 1
+    private var content = Rect()
     private val location = IntArray(2)
     val itemRects: List<Rect> get() = items.map { Rect(it.rect) }
 
@@ -28,57 +32,49 @@ class OverlayView(context: Context) : View(context) {
         captureHeight = height.coerceAtLeast(1)
         screenWidth = displayWidth.coerceAtLeast(1)
         screenHeight = displayHeight.coerceAtLeast(1)
+        content = Rect(0, 0, captureWidth, captureHeight)
         rebuild()
     }
+    fun setContentBounds(bounds: Rect) { content = Rect(bounds); postInvalidateOnAnimation() }
+    fun setTextVisible(visible: Boolean) { textVisible = visible; postInvalidateOnAnimation() }
+    fun setItems(next: List<Item>) { items = next.toList(); rebuild() }
 
-    fun setItems(next: List<Item>) {
-        items = next.toList()
-        rebuild()
-    }
-
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        rebuild()
+    companion object {
+        /** OCR reports ink bounds, not font points. Preserve the source's glyph height. */
+        fun sourceTextSize(text: String, glyphHeight: Int): Float {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 100f; typeface = Typeface.DEFAULT }
+            val bounds = Rect()
+            val sample = text.ifBlank { "Ag" }
+            paint.getTextBounds(sample, 0, sample.length, bounds)
+            return (100f * glyphHeight / bounds.height().coerceAtLeast(1)).coerceIn(8f, 180f)
+        }
     }
 
     private fun rebuild() {
-        val minTextSize = 12f * resources.displayMetrics.scaledDensity *
-            captureWidth.toFloat() / screenWidth
         rendered = items.mapNotNull { item ->
             val r = item.rect
             if (r.width() <= 0 || r.height() <= 0 || item.text.isBlank()) return@mapNotNull null
-            val pad = max(2f, minTextSize * 0.18f)
-            val box = RectF(
-                max(0f, r.left - pad), max(0f, r.top - pad),
-                min(captureWidth.toFloat(), r.right + pad), min(captureHeight.toFloat(), r.bottom + pad)
-            )
-            val available = (box.width() - pad * 2).toInt().coerceAtLeast(1)
             val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
-                color = if (Color.luminance(item.background) > 0.45f) Color.BLACK else Color.WHITE
+                typeface = Typeface.DEFAULT
+                color = Color.WHITE
+                textSize = sourceTextSize(item.sourceText, r.height())
             }
-            var size = min(28f * resources.displayMetrics.scaledDensity, r.height() * 0.72f)
-                .coerceAtLeast(minTextSize)
-            fun layout(ellipsize: Boolean): StaticLayout {
-                paint.textSize = size
-                return StaticLayout.Builder.obtain(item.text, 0, item.text.length, paint, available)
-                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                    .setIncludePad(false)
-                    .setLineSpacing(0f, 1.0f)
-                    .apply {
-                        if (ellipsize) {
-                            setMaxLines(max(1, (box.height() / (size * 1.2f)).toInt()))
-                            setEllipsize(TextUtils.TruncateAt.END)
-                        }
-                    }.build()
-            }
-            var textLayout = layout(false)
-            while (textLayout.height > box.height() - pad * 2 && size > minTextSize) {
-                size = max(minTextSize, size - 1f)
-                textLayout = layout(false)
-            }
-            if (textLayout.height > box.height() - pad * 2) textLayout = layout(true)
-            Rendered(box, textLayout, item.background)
+            val width = (item.available.right - r.left).coerceAtLeast(r.width())
+            val lineHeight = paint.fontMetrics.let { it.descent - it.ascent }
+            val maxLines = max(1, ((item.available.bottom - r.top) / lineHeight).toInt())
+            val layout = StaticLayout.Builder.obtain(item.text, 0, item.text.length, paint, width)
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL).setIncludePad(false)
+                .setLineSpacing(0f, 1f).setMaxLines(maxLines)
+                .setEllipsize(TextUtils.TruncateAt.END).build()
+            val glyph = Rect()
+            val firstLine = item.text.substring(0, layout.getLineEnd(0).coerceAtMost(item.text.length))
+            paint.getTextBounds(firstLine, 0, firstLine.length, glyph)
+            val top = r.top - (layout.getLineBaseline(0) + glyph.top).toFloat()
+            val textBottom = top + layout.getLineBaseline(layout.lineCount - 1) + paint.fontMetrics.descent
+            val box = RectF((r.left - 2).coerceAtLeast(0).toFloat(), (r.top - 2).coerceAtLeast(0).toFloat(),
+                item.available.right.coerceAtMost(captureWidth).toFloat(),
+                max(r.bottom.toFloat(), textBottom).coerceAtMost(item.available.bottom.toFloat()))
+            Rendered(box, layout, top)
         }
         postInvalidateOnAnimation()
     }
@@ -86,21 +82,19 @@ class OverlayView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         getLocationOnScreen(location)
-        val geometry = CaptureGeometry(
-            captureWidth, captureHeight, screenWidth, screenHeight, location[0], location[1]
-        )
+        val geometry = CaptureGeometry(captureWidth, captureHeight, screenWidth, screenHeight, location[0], location[1])
         canvas.save()
         canvas.translate(-location[0].toFloat(), -location[1].toFloat())
         canvas.scale(geometry.scaleX, geometry.scaleY)
-        for (item in rendered) {
-            backgroundPaint.color = item.background
+        // This layer stays present during OCR, movement and first translation: no brightness flashing.
+        backgroundPaint.alpha = 85
+        canvas.drawRect(content, backgroundPaint)
+        if (textVisible) for (item in rendered) {
             backgroundPaint.alpha = 255
             canvas.drawRect(item.box, backgroundPaint)
             canvas.save()
             canvas.clipRect(item.box)
-            val padding = max(2f, item.layout.paint.textSize * 0.18f)
-            canvas.translate(item.box.left + padding,
-                item.box.top + max(padding, (item.box.height() - item.layout.height) / 2f))
+            canvas.translate(item.box.left + if (item.box.left > 0) 2f else 0f, item.top)
             item.layout.draw(canvas)
             canvas.restore()
         }

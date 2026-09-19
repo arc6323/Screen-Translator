@@ -8,6 +8,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.view.Surface
 
 /** Owns one latest Image on its worker; a static screen does not have to produce another frame. */
@@ -25,8 +26,10 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
     private var pending: Request? = null
     private var watching: Fingerprint? = null
     private var masks = emptyList<Rect>()
-    private val columns = 24
-    private val rows = 40
+    private val columns = 80
+    private val rows = 144
+    private var suppressUntil = 0L
+    private var lastMotion = 0L
 
     fun attach(width: Int, height: Int): Surface {
         val next = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
@@ -45,7 +48,6 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
     fun request(token: Long, requireFresh: Boolean, prepared: () -> Unit, result: (Bitmap) -> Unit) {
         worker.post {
             if (closed) return@post
-            watching = null
             pending = Request(token, latest?.timestamp ?: Long.MIN_VALUE, requireFresh, result)
             main.post { if (!closed) prepared() }
         }
@@ -62,6 +64,9 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
         worker.post { masks = copy }
     }
     fun stopMonitoring() { worker.post { watching = null } }
+    fun noteOverlayChange() {
+        worker.post { watching = null; suppressUntil = SystemClock.uptimeMillis() + 100 }
+    }
 
     private fun read(source: ImageReader) {
         var acquired: Image? = null
@@ -71,14 +76,15 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
             latest?.close()
             latest = acquired
             acquired = null
-            val request = pending
-            if (request != null) deliver(request)
-            else watching?.let { reference ->
-                if (differs(latest!!, reference)) {
-                    watching = null
-                    main.post { if (!closed) sceneChanged() }
-                }
+            val now = SystemClock.uptimeMillis()
+            val next = fingerprint(latest!!)
+            val reference = watching
+            watching = next
+            if (now >= suppressUntil && reference != null && differs(next, reference) && now - lastMotion >= 50) {
+                lastMotion = now
+                main.post { if (!closed) sceneChanged() }
             }
+            pending?.let { deliver(it) }
         } catch (_: RuntimeException) {
             // Surface replacement and capture shutdown race with producer callbacks.
         } finally { acquired?.close() }
@@ -89,39 +95,37 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
             (request.requireFresh && image.timestamp <= request.afterTimestamp)) return
         val bitmap = toBitmap(image)
         pending = null
-        watching = fingerprint(bitmap)
         main.post { if (closed) bitmap.recycle() else request.result(bitmap) }
     }
 
-    private fun fingerprint(bitmap: Bitmap): Fingerprint {
+    private fun fingerprint(image: Image): Fingerprint {
         val shades = IntArray(columns * rows)
-        for (row in 0 until rows) for (column in 0 until columns) {
-            val x = ((column + 0.5f) * bitmap.width / columns).toInt().coerceIn(0, bitmap.width - 1)
-            val y = ((row + 0.5f) * bitmap.height / rows).toInt().coerceIn(0, bitmap.height - 1)
-            val color = bitmap.getPixel(x, y)
-            shades[row * columns + column] = (Color.red(color) + Color.green(color) + Color.blue(color)) / 3
-        }
-        return Fingerprint(bitmap.width, bitmap.height, shades)
-    }
-
-    private fun differs(image: Image, reference: Fingerprint): Boolean {
-        if (image.width != reference.width || image.height != reference.height) return true
         val plane = image.planes[0]
         val buffer = plane.buffer
-        var compared = 0
-        var changed = 0
         for (row in 0 until rows) for (column in 0 until columns) {
             val x = ((column + 0.5f) * image.width / columns).toInt().coerceIn(0, image.width - 1)
             val y = ((row + 0.5f) * image.height / rows).toInt().coerceIn(0, image.height - 1)
-            if (masks.any { it.contains(x, y) }) continue
             val offset = y * plane.rowStride + x * plane.pixelStride
-            if (offset < 0 || offset + 2 >= buffer.limit()) continue
-            val shade = ((buffer.get(offset).toInt() and 255) +
-                (buffer.get(offset + 1).toInt() and 255) + (buffer.get(offset + 2).toInt() and 255)) / 3
-            compared++
-            if (kotlin.math.abs(shade - reference.shades[row * columns + column]) > 30) changed++
+            if (offset + 2 < buffer.limit()) shades[row * columns + column] =
+                ((buffer.get(offset).toInt() and 255) + (buffer.get(offset + 1).toInt() and 255) +
+                    (buffer.get(offset + 2).toInt() and 255)) / 3
         }
-        return compared > 20 && changed > maxOf(8, compared / 6)
+        return Fingerprint(image.width, image.height, shades)
+    }
+
+    private fun differs(next: Fingerprint, reference: Fingerprint): Boolean {
+        if (next.width != reference.width || next.height != reference.height) return true
+        var compared = 0
+        var changed = 0
+        for (row in 0 until rows) for (column in 0 until columns) {
+            val x = ((column + 0.5f) * next.width / columns).toInt()
+            val y = ((row + 0.5f) * next.height / rows).toInt()
+            if (masks.any { it.contains(x, y) }) continue
+            compared++
+            val index = row * columns + column
+            if (kotlin.math.abs(next.shades[index] - reference.shades[index]) > 12) changed++
+        }
+        return compared > 20 && changed > maxOf(10, compared / 100)
     }
 
     private fun toBitmap(image: Image): Bitmap {

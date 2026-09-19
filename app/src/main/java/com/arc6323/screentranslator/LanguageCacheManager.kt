@@ -35,7 +35,7 @@ object LanguageCacheManager {
     private val handler = Handler(Looper.getMainLooper())
     private val listeners = linkedSetOf<() -> Unit>()
     private val manager get() = RemoteModelManager.getInstance()
-    var downloaded: Set<String> = setOf("en")
+    var downloaded: Set<String> = setOf("en", "ru")
         private set
     var checking = false
         private set
@@ -111,7 +111,7 @@ object LanguageCacheManager {
             .addOnSuccessListener { models ->
                 checking = false
                 if (revision == expectedRevision) {
-                    downloaded = models.map { it.language }.toSet() + "en"
+                    downloaded = models.map { it.language }.toSet() + setOf("en", "ru")
                     lastError = null
                 }
                 notifyChanged()
@@ -159,7 +159,7 @@ object LanguageCacheManager {
     private fun model(code: String): TranslateRemoteModel? =
         TranslateLanguage.fromLanguageTag(code)?.let { TranslateRemoteModel.Builder(it).build() }
     private fun ensureModel(code: String, done: (String?) -> Unit) {
-        if (code == "en") { done(null); return }
+        if (code in setOf("en", "ru")) { done(null); return }
         val model = model(code)
         if (model == null) { done("Язык не поддерживается"); return }
         val conditions = DownloadConditions.Builder().apply {

@@ -28,11 +28,12 @@ import java.util.LinkedHashMap
 
 class FrameAnalyzer(context: Context) : AutoCloseable {
     data class Result(val items: List<OverlayView.Item>, val elapsedMs: Long, val unchanged: Boolean, val error: String? = null)
-    private data class Block(val text: String, val rect: Rect, val background: Int)
+    private data class Block(val text: String, val rect: Rect, val background: Int, val available: Rect)
     private val main = Handler(Looper.getMainLooper())
     private val thread = HandlerThread("ocr-preparation").apply { start() }
     private val worker = Handler(thread.looper)
     private val cyrillic = CyrillicGuard(context)
+    private val russian = BundledRussianTranslator(context)
     private val recognizers = mutableMapOf<String, TextRecognizer>()
     private val languageId = LanguageIdentification.getClient(
         LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.20f).build())
@@ -147,7 +148,16 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
                             if (checked == null) guardUnavailable = true
                             allowed = checked == true
                         }
-                        if (allowed) batch.add(Block(text, Rect(rect), sampleBackground(bitmap, rect)))
+                        if (allowed) {
+                            // Bound layout by all detected neighbours, including untranslated text.
+                            val others = unique.mapNotNull { it.boundingBox }.filter { it !== rect }
+                            val right = others.filter { it.left >= rect.right && it.top < rect.bottom && it.bottom > rect.top }
+                                .minOfOrNull { it.left - 4 } ?: (bounds.right - 4)
+                            val bottom = others.filter { it.top >= rect.bottom && it.left < right && it.right > rect.left }
+                                .minOfOrNull { it.top - 3 } ?: bounds.bottom
+                            batch.add(Block(text, Rect(rect), sampleBackground(bitmap, rect),
+                                Rect(rect.left, rect.top, right.coerceAtLeast(rect.right), bottom.coerceAtLeast(rect.bottom))))
+                        }
                         if (index % 4 == 3) {
                             submitBatch(batchId++, batch.toList())
                             batch = mutableListOf()
@@ -244,32 +254,73 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
         fun result(block: Block, text: String?) {
             if (text == null) failures++
             else if (text.isNotBlank() && text.trim() != block.text.trim()) {
-                items.add(OverlayView.Item(block.rect, text.trim(), block.background))
+                items.add(OverlayView.Item(block.rect, text.trim(), block.background, block.text, block.available))
                 publish()
             }
             remaining--
             if (remaining == 0) finish()
+        }
+        if (target == "ru") {
+            val needed = blocks.filter { (block, source) ->
+                val cached = textCache[source + "|ru|" + block.text]
+                if (cached != null) { result(block, cached); false } else true
+            }
+            if (needed.isEmpty()) return
+            val english = arrayOfNulls<String>(needed.size)
+            var waiting = needed.size
+            fun ready() {
+                if (closed || !current()) return
+                val valid = needed.indices.filter { english[it] != null }
+                needed.indices.filter { english[it] == null }.forEach { result(needed[it].first, null) }
+                if (valid.isEmpty()) return
+                russian.translate(valid.map { english[it]!! }, current) { translated ->
+                    valid.forEachIndexed { index, original ->
+                        val (block, source) = needed[original]
+                        val text = translated?.getOrNull(index)?.takeIf { it.isNotBlank() }
+                        if (text != null) textCache[source + "|ru|" + block.text] = text
+                        result(block, text)
+                    }
+                }
+            }
+            needed.forEachIndexed { index, (block, source) ->
+                if (source == "en") {
+                    english[index] = block.text
+                    waiting--; if (waiting == 0) ready()
+                } else {
+                    try {
+                        mlTask(source, "en", block.text)
+                            .addOnSuccessListener { english[index] = it }
+                            .addOnCompleteListener { waiting--; if (waiting == 0) ready() }
+                    } catch (_: RuntimeException) { waiting--; if (waiting == 0) ready() }
+                }
+            }
+            return
         }
         blocks.forEach { (block, source) ->
             val key = source + "|" + target + "|" + block.text
             val cached = textCache[key]
             if (cached != null) result(block, cached)
             else try {
-                val task = inFlight.getOrPut(key) {
-                    val translator = translators.getOrPut(source + "->" + target) {
-                        Translation.getClient(TranslatorOptions.Builder()
-                            .setSourceLanguage(TranslateLanguage.fromLanguageTag(source)!!)
-                            .setTargetLanguage(TranslateLanguage.fromLanguageTag(target)!!).build())
-                    }
-                    translator.translate(block.text).also { task ->
-                        // Keep successful work even if a newer frame has superseded its screen coordinates.
-                        task.addOnSuccessListener { if (!closed) textCache[key] = it }
-                        task.addOnCompleteListener { inFlight.remove(key) }
-                    }
-                }
+                val task = mlTask(source, target, block.text)
                 task.addOnSuccessListener { result(block, it) }
                     .addOnFailureListener { result(block, null) }
             } catch (_: RuntimeException) { result(block, null) }
+        }
+    }
+
+    private fun mlTask(source: String, target: String, text: String): Task<String> {
+        val key = "$source|$target|$text"
+        textCache[key]?.let { return com.google.android.gms.tasks.Tasks.forResult(it) }
+        return inFlight.getOrPut(key) {
+            val translator = translators.getOrPut("$source->$target") {
+                Translation.getClient(TranslatorOptions.Builder()
+                    .setSourceLanguage(TranslateLanguage.fromLanguageTag(source)!!)
+                    .setTargetLanguage(TranslateLanguage.fromLanguageTag(target)!!).build())
+            }
+            translator.translate(text).also { task ->
+                task.addOnSuccessListener { if (!closed) textCache[key] = it }
+                task.addOnCompleteListener { inFlight.remove(key) }
+            }
         }
     }
 
@@ -329,6 +380,7 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
 
     override fun close() {
         closed = true
+        russian.close()
         fun release() {
             if (ocrBusy) { main.postDelayed({ closeWhenIdle() }, 100); return }
             worker.post { cyrillic.close(); thread.quitSafely() }

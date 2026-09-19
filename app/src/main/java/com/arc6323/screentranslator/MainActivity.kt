@@ -70,7 +70,7 @@ class MainActivity : Activity() {
         root.addView(cacheStatus)
         root.addView(label(
             "Перевод поверх приложения. Пауза, продолжение и выключение — в уведомлении.\n" +
-                "Текст на языке результата пропускается. Неуверенно распознанные строки остаются без изменений.",
+                "При касании перевод скрывается, после остановки страницы появляется снова.\nТекст на языке результата пропускается. Неуверенно распознанные строки остаются без изменений.",
             14
         ))
         start = button("ВКЛЮЧИТЬ ПЕРЕВОД") { beginStart() }
@@ -98,7 +98,7 @@ class MainActivity : Activity() {
         languagesPanel.addView(label("Языки", 23))
         languagesPanel.addView(label(
             "Выбор источника сохраняется сразу. Наличие модели показано отдельно.\n" +
-                "Размер скачиваемой модели — примерно 30 МБ. English встроен и не требует загрузки.",
+                "Размер скачиваемой модели — примерно 30 МБ. English и русский перевод встроены и не требуют загрузки.",
             13
         ))
         val find = EditText(this).apply {
@@ -277,7 +277,7 @@ class MainActivity : Activity() {
             row.check.isEnabled = !running && !q.active && code !in setOf("ru", "en")
             row.check.setOnCheckedChangeListener { _, checked -> manager.setSelected(this, code, checked) }
             row.state.text = when {
-                code == "en" -> "Встроен • готов\n0 МБ загрузки"
+                code in setOf("en", "ru") -> "Встроен • готов\n0 МБ загрузки"
                 manager.isDeleting(code) -> "Удаляется…"
                 q.current == code -> "Скачивается… • ≈30 МБ"
                 code in q.queued -> "В очереди • ≈30 МБ"

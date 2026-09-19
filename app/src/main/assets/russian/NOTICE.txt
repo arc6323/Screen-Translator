@@ -1,0 +1,8 @@
+Embedded English to Russian translation: OPUS-MT, Helsinki-NLP / Language Technology Research Group at the University of Helsinki.
+Original model and attribution: https://huggingface.co/Helsinki-NLP/opus-mt-en-ru
+Quantized ONNX conversion: Xenova, https://huggingface.co/Xenova/opus-mt-en-ru
+Pinned conversion revision: e050376e960175e8ddc5cff85025dc8436cddd68
+Model license: Apache License 2.0 (LICENSE.txt).
+Inference: Microsoft ONNX Runtime (MIT), https://github.com/microsoft/onnxruntime
+Tokenizer implements this pinned model's Unigram vocabulary, whitespace and metaspace configuration.
+Other source languages use downloaded ML Kit models to translate into English before the embedded Russian model.
