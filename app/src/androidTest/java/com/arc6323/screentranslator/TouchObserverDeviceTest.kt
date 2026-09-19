@@ -22,7 +22,9 @@ class TouchObserverDeviceTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val automation = instrumentation.uiAutomation
-        automation.executeShellCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW allow").close()
+        automation.executeShellCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW allow").use { fd ->
+            java.io.FileInputStream(fd.fileDescriptor).use { it.readBytes() }
+        }
         assertNotEquals(context.applicationInfo.uid, instrumentation.context.applicationInfo.uid)
         context.startActivity(Intent().setComponent(ComponentName(instrumentation.context.packageName,
             TouchProbeActivity::class.java.name)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

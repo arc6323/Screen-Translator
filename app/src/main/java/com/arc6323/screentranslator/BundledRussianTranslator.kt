@@ -101,7 +101,7 @@ class BundledRussianTranslator(context: Context) : AutoCloseable {
                     checkNotNull(decoder).run(feed)
                 }
                 if (first == null) first = result
-                val logits = (result.get("logits").get() as OnnxTensor).floatBuffer.get()
+                val logits = (result.get("logits").get() as OnnxTensor).floatBuffer
                 next = LongArray(batch)
                 for (row in 0 until batch) {
                     var best = 0

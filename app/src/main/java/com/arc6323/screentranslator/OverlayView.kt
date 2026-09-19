@@ -71,8 +71,9 @@ class OverlayView(context: Context) : View(context) {
             paint.getTextBounds(firstLine, 0, firstLine.length, glyph)
             val top = r.top - (layout.getLineBaseline(0) + glyph.top).toFloat()
             val textBottom = top + layout.getLineBaseline(layout.lineCount - 1) + paint.fontMetrics.descent
+            val inkRight = r.left + max(r.width().toFloat(), (0 until layout.lineCount).maxOf { layout.getLineWidth(it) }) + 2
             val box = RectF((r.left - 2).coerceAtLeast(0).toFloat(), (r.top - 2).coerceAtLeast(0).toFloat(),
-                item.available.right.coerceAtMost(captureWidth).toFloat(),
+                inkRight.coerceAtMost(item.available.right.toFloat()).coerceAtMost(captureWidth.toFloat()),
                 max(r.bottom.toFloat(), textBottom).coerceAtMost(item.available.bottom.toFloat()))
             Rendered(box, layout, top)
         }
