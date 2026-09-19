@@ -42,6 +42,8 @@ class CaptureEngine(private val main: Handler, private val sceneChanged: () -> U
             pending = null
             watching = null
             next.setOnImageAvailableListener({ source -> read(source) }, worker)
+            // A static producer may queue its only image before the listener is installed.
+            read(next)
         }
         return next.surface
     }
