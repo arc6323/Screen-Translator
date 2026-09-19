@@ -44,6 +44,8 @@ class FrameAnalyzer(context: Context) : AutoCloseable {
     @Volatile private var closed = false
     @Volatile private var ocrBusy = false
     val isBusy: Boolean get() = ocrBusy
+    val russianReady: Boolean get() = russian.isReady
+    fun warmRussian() = russian.warmUp()
     private var previousVisual: String? = null
     private var previousResult: Result? = null
 

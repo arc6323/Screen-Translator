@@ -131,6 +131,7 @@ class TranslatorService : Service() {
             ) ?: error("Capture display unavailable")
             createOverlay()
             frames.start()
+            if (LanguageCacheManager.targetLanguage(this) == "ru") analyzer.warmRussian()
             setStatus("Перевод включён")
             schedule(0)
         } catch (_: Exception) {
@@ -217,6 +218,8 @@ class TranslatorService : Service() {
         if (analyzer.isBusy) { schedule(40); return }
         val token = frames.begin() ?: return
         activeToken = token
+        if (LanguageCacheManager.targetLanguage(this) == "ru" && !analyzer.russianReady)
+            setStatus("Подготовка встроенного русского перевода…")
         val watchdog = Runnable {
             if (frames.finish(token)) {
                 activeToken = null
@@ -245,7 +248,10 @@ class TranslatorService : Service() {
                 bitmap, LanguageCacheManager.selected(this), LanguageCacheManager.targetLanguage(this),
                 contentBounds(), current = { frames.accepts(token) },
                 partial = { items ->
-                    if (frames.accepts(token)) showItems(items)
+                    if (frames.accepts(token)) {
+                        showItems(items)
+                        if (items.isNotEmpty()) setStatus("Перевод включён")
+                    }
                 }
             ) { result ->
                 if (frames.finish(token)) {

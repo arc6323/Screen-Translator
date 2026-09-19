@@ -18,6 +18,11 @@ class BundledRussianTranslator(context: Context) : AutoCloseable {
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var closed = false
+    @Volatile var isReady = false
+        private set
+    fun warmUp() {
+        worker.execute { if (!closed) try { prepare() } catch (_: Exception) { /* The request reports an error. */ } }
+    }
     private var tokenizer: UnigramTokenizer? = null
     private var encoder: OrtSession? = null
     private var decoder: OrtSession? = null
@@ -52,6 +57,7 @@ class BundledRussianTranslator(context: Context) : AutoCloseable {
             try {
                 encoder = environment.createSession(model("encoder_model_quantized.onnx", 51628446), options)
                 decoder = environment.createSession(model("decoder_model_merged_quantized.onnx", 58931576), options)
+                isReady = true
             } catch (e: Exception) {
                 encoder?.close(); encoder = null; decoder?.close(); decoder = null
                 throw e
